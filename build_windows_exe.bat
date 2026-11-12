@@ -1,24 +1,25 @@
 @echo off
-chcp 65001 >nul
-title Max1m — Сборка Windows-приложения (Max1m.exe)
+title Max1m - Build Windows EXE
 cd /d "%~dp0"
 
 echo =================================================================
-echo   Сборка автономного Windows-клиента Max1m (Max1m.exe + ZIP)
+echo   Max1m - Building standalone Windows app Max1m.exe + ZIP
 echo =================================================================
 echo.
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0packaging\build_windows.ps1"
-if errorlevel 1 (
-    echo.
-    echo [ОШИБКА] Сборка завершилась с ошибкой. Проверьте вывод выше.
-    pause
-    exit /b 1
-)
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0packaging\build_windows.ps1"
+if errorlevel 1 goto :fail
 
 echo.
-echo Теперь вы можете запустить сразу 2 независимых окна для теста через туннель:
-echo   -> двойным кликом по run_two_windows.bat
-echo   -> или из папки packaging\dist\Max1m\launch_two_instances.bat
+echo Ready! Next steps:
+echo   1. Run run_local_test_server.bat to start the server on port 8000
+echo   2. Run run_two_windows.bat to open 2 isolated Max1m windows
 echo.
 pause
+exit /b 0
+
+:fail
+echo.
+echo [ERROR] Build failed. Please check the messages above.
+pause
+exit /b 1

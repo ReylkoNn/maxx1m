@@ -1,15 +1,11 @@
 @echo off
-chcp 65001 >nul
-title Max1m — Запуск 2 независимых окон для теста созвона / туннеля
+title Max1m - Launch 2 Isolated Instances
 cd /d "%~dp0"
 
-echo Запускаем Окно #1 (профиль ~/.max1m) ...
+echo [1/2] Starting Window #1 ...
 start "" "%~dp0Max1m.exe" --instance 1
 
 timeout /t 2 /nobreak >nul
 
-echo Запускаем Окно #2 (изолированный профиль ~/.max1m_inst_2) ...
+echo [2/2] Starting Window #2 ...
 start "" "%~dp0Max1m.exe" --instance 2
-
-echo Готово! В каждом окне укажите URL вашего туннеля (или http://127.0.0.1:8000),
-echo войдите под двумя разными аккаунтами, сверьте 60-значный код и нажмите на звонок!

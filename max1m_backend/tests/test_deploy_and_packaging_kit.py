@@ -115,3 +115,12 @@ def test_pyinstaller_windows_packaging_kit_structure():
     assert "Max1m-Windows-x64.zip" in ps1_text
     assert (REPO_ROOT / "packaging" / "build_portable.py").is_file()
     assert (REPO_ROOT / "docs" / "DEPLOY_RU_VPS.md").is_file()
+
+    # Guard against Windows cmd.exe / PowerShell 5.1 UTF-8 byte-offset & BOM corruption
+    win_scripts = list(REPO_ROOT.glob("*.bat")) + list((REPO_ROOT / "packaging").glob("*.bat")) + list((REPO_ROOT / "packaging").glob("*.ps1")) + list((REPO_ROOT / "max1m_desktop").glob("*.bat"))
+    assert len(win_scripts) >= 7
+    for scr in win_scripts:
+        raw = scr.read_bytes()
+        assert all(b < 128 for b in raw), f"Non-ASCII byte in {scr} breaks cmd.exe / PowerShell 5.1!"
+        assert b"chcp 65001" not in raw.lower()
+

@@ -183,4 +183,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    import sys
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
     raise SystemExit(main())
