@@ -8,6 +8,33 @@ $RepoRoot   = Split-Path -Parent $ScriptDir
 $BackendDir = Join-Path $RepoRoot "max1m_backend"
 Set-Location $BackendDir
 
+function Resolve-ShortBuildRoot {
+    param([string]$BaseDir)
+    $driveRoot = [System.IO.Path]::GetPathRoot($BaseDir)
+    $candidates = @()
+    if ($driveRoot) {
+        $candidates += (Join-Path $driveRoot ".m1b")
+    }
+    if ($env:USERPROFILE) {
+        $candidates += (Join-Path $env:USERPROFILE ".m1b")
+    }
+    if ($env:SystemDrive) {
+        $candidates += ($env:SystemDrive + "\.m1b")
+    }
+    foreach ($dir in $candidates) {
+        try {
+            if (-not (Test-Path $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            }
+            $probe = Join-Path $dir "_w.tmp"
+            [System.IO.File]::WriteAllText($probe, "ok")
+            Remove-Item $probe -Force -ErrorAction SilentlyContinue
+            return $dir
+        } catch {}
+    }
+    return (Join-Path $BaseDir ".m1b")
+}
+
 function Resolve-BackendPython {
     $candidates = @(
         (Join-Path $BackendDir ".venv\Scripts\python.exe"),
@@ -43,11 +70,16 @@ function Resolve-BackendPython {
     return $null
 }
 
-$VenvPy = Join-Path $BackendDir ".venv\Scripts\python.exe"
+$ShortRoot    = Resolve-ShortBuildRoot -BaseDir $RepoRoot
+$ShortVenvDir = Join-Path $ShortRoot "bv"
+$ShortVenvPy  = Join-Path $ShortVenvDir "Scripts\python.exe"
+$LocalVenvPy  = Join-Path $BackendDir ".venv\Scripts\python.exe"
 $LegacyVenvPy = Join-Path $BackendDir "venv\Scripts\python.exe"
 
-if (Test-Path $VenvPy) {
-    $PyExe = $VenvPy
+if (Test-Path $ShortVenvPy) {
+    $PyExe = $ShortVenvPy
+} elseif (Test-Path $LocalVenvPy) {
+    $PyExe = $LocalVenvPy
 } elseif (Test-Path $LegacyVenvPy) {
     $PyExe = $LegacyVenvPy
 } else {
@@ -56,10 +88,10 @@ if (Test-Path $VenvPy) {
         Write-Host "[ERROR] Python 3.10-3.13 was not found." -ForegroundColor Red
         exit 1
     }
-    Write-Host "[1/3] Creating backend virtualenv max1m_backend\.venv ..." -ForegroundColor Cyan
-    & $BasePy -m venv (Join-Path $BackendDir ".venv")
+    Write-Host "[1/3] Creating short-path backend virtualenv: $ShortVenvDir ..." -ForegroundColor Cyan
+    & $BasePy -m venv $ShortVenvDir
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    $PyExe = $VenvPy
+    $PyExe = $ShortVenvPy
     & $PyExe -m pip install --upgrade pip wheel
     & $PyExe -m pip install -r (Join-Path $BackendDir "requirements.txt")
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -1,8 +1,9 @@
 # =============================================================================
 # Max1m - Build standalone Windows client Max1m.exe (PowerShell 5.1 / 7+)
-# Supports Python 3.10, 3.11, 3.12, 3.13 (x64 prebuilt wheels, no MSVC needed).
+# Uses ultra-short build root (<Drive>:\.m1b) to avoid Windows 260-char MAX_PATH
+# errors on PySide6 QML paths even when unpacked inside deep folders.
 # Output:
-#   packaging\dist\Max1m\Max1m.exe
+#   packaging\dist\Max1m\Max1m.exe  (and <Drive>:\.m1b\dist\Max1m\Max1m.exe)
 #   packaging\dist\Max1m\launch_two_instances.bat
 #   packaging\dist\Max1m-Windows-x64.zip
 # =============================================================================
@@ -11,6 +12,33 @@ $ErrorActionPreference = "Continue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot  = Split-Path -Parent $ScriptDir
 Set-Location $RepoRoot
+
+function Resolve-ShortBuildRoot {
+    param([string]$BaseDir)
+    $driveRoot = [System.IO.Path]::GetPathRoot($BaseDir)
+    $candidates = @()
+    if ($driveRoot) {
+        $candidates += (Join-Path $driveRoot ".m1b")
+    }
+    if ($env:USERPROFILE) {
+        $candidates += (Join-Path $env:USERPROFILE ".m1b")
+    }
+    if ($env:SystemDrive) {
+        $candidates += ($env:SystemDrive + "\.m1b")
+    }
+    foreach ($dir in $candidates) {
+        try {
+            if (-not (Test-Path $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            }
+            $probe = Join-Path $dir "_w.tmp"
+            [System.IO.File]::WriteAllText($probe, "ok")
+            Remove-Item $probe -Force -ErrorAction SilentlyContinue
+            return $dir
+        } catch {}
+    }
+    return (Join-Path $BaseDir ".m1b")
+}
 
 function Resolve-CompatiblePython {
     $candidates = @(
@@ -52,23 +80,26 @@ if (-not $BasePython) {
     Write-Host "[ERROR] Python 3.10-3.13 (x64) was not found on this machine." -ForegroundColor Red
     exit 1
 }
-Write-Host "[1/4] Using Python interpreter: $BasePython" -ForegroundColor Cyan
 
-$VenvDir = Join-Path $ScriptDir ".build_venv"
-$PyExe   = Join-Path $VenvDir "Scripts\python.exe"
-$PipExe  = Join-Path $VenvDir "Scripts\pip.exe"
+$ShortRoot = Resolve-ShortBuildRoot -BaseDir $RepoRoot
+$VenvDir   = Join-Path $ShortRoot "dv"
+$PyExe     = Join-Path $VenvDir "Scripts\python.exe"
+
+Write-Host "[1/4] Python interpreter : $BasePython" -ForegroundColor Cyan
+Write-Host "      Short build root   : $ShortRoot (bypasses Windows 260-char MAX_PATH)" -ForegroundColor Cyan
 
 if (-not (Test-Path $PyExe)) {
-    Write-Host "[2/4] Creating isolated build virtualenv: $VenvDir ..." -ForegroundColor Cyan
+    Write-Host "[2/4] Creating short-path build virtualenv: $VenvDir ..." -ForegroundColor Cyan
     & $BasePython -m venv $VenvDir
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "[ERROR] Failed to create virtualenv." -ForegroundColor Red
+        Write-Host "[ERROR] Failed to create virtualenv at $VenvDir" -ForegroundColor Red
         exit 1
     }
 }
 
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
+$env:MAX1M_SHORT_BUILD_ROOT = $ShortRoot
 
 Write-Host "[3/4] Installing desktop dependencies and PyInstaller (pyinstaller==6.11.1) ..." -ForegroundColor Cyan
 & $PyExe -m pip install --upgrade pip wheel
@@ -91,6 +122,7 @@ Write-Host ""
 Write-Host "=================================================================" -ForegroundColor Green
 Write-Host "  BUILD SUCCEEDED!" -ForegroundColor Green
 Write-Host "  Executable : packaging\dist\Max1m\Max1m.exe"
-Write-Host "  2 Windows  : packaging\dist\Max1m\launch_two_instances.bat"
+Write-Host "  Fallback   : $ShortRoot\dist\Max1m\Max1m.exe"
+Write-Host "  2 Windows  : run_two_windows.bat"
 Write-Host "  ZIP Bundle : packaging\dist\Max1m-Windows-x64.zip"
 Write-Host "=================================================================" -ForegroundColor Green

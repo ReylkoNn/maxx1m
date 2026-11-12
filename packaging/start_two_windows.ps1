@@ -6,23 +6,61 @@ $ErrorActionPreference = "Continue"
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot   = Split-Path -Parent $ScriptDir
 $DesktopDir = Join-Path $RepoRoot "max1m_desktop"
-$BuiltExe   = Join-Path $ScriptDir "dist\Max1m\Max1m.exe"
 
-if (Test-Path $BuiltExe) {
-    Write-Host "[EXE] Launching Window #1 (~/.max1m) ..." -ForegroundColor Cyan
-    Start-Process -FilePath $BuiltExe -ArgumentList @("--instance", "1") -WorkingDirectory (Split-Path -Parent $BuiltExe)
+function Resolve-ShortBuildRoot {
+    param([string]$BaseDir)
+    $driveRoot = [System.IO.Path]::GetPathRoot($BaseDir)
+    $candidates = @()
+    if ($driveRoot) {
+        $candidates += (Join-Path $driveRoot ".m1b")
+    }
+    if ($env:USERPROFILE) {
+        $candidates += (Join-Path $env:USERPROFILE ".m1b")
+    }
+    if ($env:SystemDrive) {
+        $candidates += ($env:SystemDrive + "\.m1b")
+    }
+    foreach ($dir in $candidates) {
+        try {
+            if (-not (Test-Path $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            }
+            $probe = Join-Path $dir "_w.tmp"
+            [System.IO.File]::WriteAllText($probe, "ok")
+            Remove-Item $probe -Force -ErrorAction SilentlyContinue
+            return $dir
+        } catch {}
+    }
+    return (Join-Path $BaseDir ".m1b")
+}
+
+$ShortRoot    = Resolve-ShortBuildRoot -BaseDir $RepoRoot
+$RepoBuiltExe = Join-Path $ScriptDir "dist\Max1m\Max1m.exe"
+$ShortBuiltExe = Join-Path $ShortRoot "dist\Max1m\Max1m.exe"
+
+$TargetExe = $null
+if (Test-Path $ShortBuiltExe) {
+    $TargetExe = $ShortBuiltExe
+} elseif (Test-Path $RepoBuiltExe) {
+    $TargetExe = $RepoBuiltExe
+}
+
+if ($TargetExe) {
+    Write-Host "[EXE] Using $TargetExe" -ForegroundColor Cyan
+    Write-Host "[1/2] Launching Window #1 (~/.max1m) ..." -ForegroundColor Cyan
+    Start-Process -FilePath $TargetExe -ArgumentList @("--instance", "1") -WorkingDirectory (Split-Path -Parent $TargetExe)
     Start-Sleep -Seconds 2
-    Write-Host "[EXE] Launching Window #2 (~/.max1m_inst_2) ..." -ForegroundColor Cyan
-    Start-Process -FilePath $BuiltExe -ArgumentList @("--instance", "2") -WorkingDirectory (Split-Path -Parent $BuiltExe)
+    Write-Host "[2/2] Launching Window #2 (~/.max1m_inst_2) ..." -ForegroundColor Cyan
+    Start-Process -FilePath $TargetExe -ArgumentList @("--instance", "2") -WorkingDirectory (Split-Path -Parent $TargetExe)
     Write-Host "[OK] Both Max1m.exe windows started!" -ForegroundColor Green
     exit 0
 }
 
 $candidates = @(
-    (Join-Path $ScriptDir ".build_venv\Scripts\pythonw.exe"),
+    (Join-Path $ShortRoot "dv\Scripts\pythonw.exe"),
+    (Join-Path $ShortRoot "dv\Scripts\python.exe"),
     (Join-Path $DesktopDir ".venv\Scripts\pythonw.exe"),
     (Join-Path $DesktopDir "venv\Scripts\pythonw.exe"),
-    (Join-Path $ScriptDir ".build_venv\Scripts\python.exe"),
     (Join-Path $DesktopDir ".venv\Scripts\python.exe"),
     (Join-Path $DesktopDir "venv\Scripts\python.exe"),
     (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"),
