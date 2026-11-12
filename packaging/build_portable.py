@@ -2,19 +2,81 @@
 """
 Cross-platform portable archive builder for Max1m Desktop (`Max1m.exe` on Windows,
 `Max1m` binary folder on Linux/macOS) using `packaging/max1m_desktop.spec`.
-Uses short work/staging directories when `MAX1M_SHORT_BUILD_ROOT` is provided so
-Windows builds never hit the legacy 260-character `MAX_PATH` limit even when the
-repository ZIP is extracted inside deeply nested folders.
+Includes:
+- Automatic short build/staging root (`MAX1M_SHORT_BUILD_ROOT`) so Windows builds
+  never hit the 260-character `MAX_PATH` limit.
+- Automatic CPython 3.10.0 `bpo-45757` (`pyinstaller#6301`) `dis` / `modulegraph`
+  `IndexError` guard so early Python 3.10 installations scan bytecode cleanly.
 """
 
 from __future__ import annotations
 
+import dis
+import inspect
 import os
 import platform
 import shutil
-import subprocess
 import sys
 from pathlib import Path
+
+
+def _patch_cpython_310_dis_bug() -> None:
+    """
+    Guard against CPython 3.10.0 bug bpo-45757 (pyinstaller#6301), where dead
+    bytecode following an EXTENDED_ARG jump causes `dis` (`_get_const_info`,
+    `_get_name_info`, or `cmp_op[arg]`) to raise `IndexError: tuple index out of range`
+    during PyInstaller's modulegraph bytecode scan.
+    """
+    orig_const = getattr(dis, "_get_const_info", None)
+    if callable(orig_const) and not getattr(orig_const, "_max1m_patched", False):
+        def _safe_const(*args, **kwargs):
+            try:
+                return orig_const(*args, **kwargs)
+            except IndexError:
+                idx = args[0] if args else None
+                return idx, repr(idx)
+
+        _safe_const._max1m_patched = True  # type: ignore[attr-defined]
+        dis._get_const_info = _safe_const  # type: ignore[attr-defined]
+
+    orig_name = getattr(dis, "_get_name_info", None)
+    if callable(orig_name) and not getattr(orig_name, "_max1m_patched", False):
+        def _safe_name(*args, **kwargs):
+            try:
+                return orig_name(*args, **kwargs)
+            except IndexError:
+                idx = args[0] if args else ""
+                return str(idx), str(idx)
+
+        _safe_name._max1m_patched = True  # type: ignore[attr-defined]
+        dis._get_name_info = _safe_name  # type: ignore[attr-defined]
+
+    try:
+        import PyInstaller.lib.modulegraph.util as mg_util
+
+        if not getattr(mg_util.iterate_instructions, "_max1m_patched", False):
+            def _safe_iterate_instructions(code_object):
+                try:
+                    for inst in dis.get_instructions(code_object):
+                        if inst.opname != "EXTENDED_ARG":
+                            yield inst
+                except IndexError:
+                    pass
+                yield None
+                for constant in code_object.co_consts:
+                    if inspect.iscode(constant):
+                        yield from _safe_iterate_instructions(constant)
+
+            _safe_iterate_instructions._max1m_patched = True  # type: ignore[attr-defined]
+            mg_util.iterate_instructions = _safe_iterate_instructions
+            try:
+                import PyInstaller.lib.modulegraph.modulegraph as mg_mod
+                if hasattr(mg_mod, "iterate_instructions"):
+                    mg_mod.iterate_instructions = _safe_iterate_instructions
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def _win_long_path(p: Path) -> str:
@@ -41,6 +103,8 @@ def _copytree_win_safe(src: Path, dst: Path) -> None:
 
 
 def build_bundle() -> Path:
+    _patch_cpython_310_dis_bug()
+
     pkg_dir = Path(__file__).resolve().parent
     spec_file = pkg_dir / "max1m_desktop.spec"
     repo_dist_dir = pkg_dir / "dist"
@@ -57,19 +121,19 @@ def build_bundle() -> Path:
     pyi_dist_dir.mkdir(parents=True, exist_ok=True)
     pyi_work_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "PyInstaller",
-        "--noconfirm",
-        "--clean",
-        "--distpath",
-        str(pyi_dist_dir),
-        "--workpath",
-        str(pyi_work_dir),
-        str(spec_file),
-    ]
-    subprocess.run(cmd, check=True)
+    import PyInstaller.__main__
+
+    PyInstaller.__main__.run(
+        [
+            "--noconfirm",
+            "--clean",
+            "--distpath",
+            str(pyi_dist_dir),
+            "--workpath",
+            str(pyi_work_dir),
+            str(spec_file),
+        ]
+    )
 
     bundle_dir = pyi_dist_dir / "Max1m"
     if not bundle_dir.is_dir():
@@ -85,7 +149,6 @@ def build_bundle() -> Path:
 
     zip_path = Path(shutil.make_archive(str(archive_stem), "zip", root_dir=pyi_dist_dir, base_dir="Max1m"))
 
-    # Mirror finished bundle and ZIP back into packaging/dist (using Win32 long-path safe copy)
     if pyi_dist_dir.resolve() != repo_dist_dir.resolve():
         os.makedirs(_win_long_path(repo_dist_dir), exist_ok=True)
         try:
