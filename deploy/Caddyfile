@@ -1,0 +1,33 @@
+{
+    admin off
+    servers {
+        protocols h1 h2
+    }
+}
+
+{$MAX1M_DOMAIN} {
+    # Disable HTTP access logging on disk/stdout (anti-surveillance metadata hygiene)
+    log {
+        output discard
+    }
+
+    tls {
+        protocols tls1.3
+    }
+
+    header {
+        Strict-Transport-Security "max-age=63072000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        -Server
+    }
+
+    request_body {
+        max_size 25MB
+    }
+
+    reverse_proxy backend:8000 {
+        flush_interval -1
+    }
+}

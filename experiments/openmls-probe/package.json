@@ -1,0 +1,13 @@
+{
+  "name": "max1m-openmls-probe",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Isolated experimental OpenMLS WASM feasibility probe; not a production bridge",
+  "engines": {"node": ">=22"},
+  "scripts": {
+    "test": "node --experimental-wasm-modules --test test/*.test.mjs",
+    "probe": "node --experimental-wasm-modules probe.mjs"
+  },
+  "dependencies": {"openmls-wasm": "0.1.0"}
+}

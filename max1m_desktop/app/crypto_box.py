@@ -1,9 +1,50 @@
 import hashlib
+import struct
 from nacl.signing import SigningKey, VerifyKey
 from nacl.public import Box
 from nacl.secret import SecretBox
 import nacl.utils
 from nacl.encoding import Base64Encoder
+
+PADDING_MAGIC = b"\x00MXP1"
+PADDING_HEADER_LEN = 9  # 5-byte magic + 4-byte big-endian payload length
+TRAFFIC_PAD_BUCKETS = (512, 2048, 8192, 32768, 65536)
+LARGE_PAD_QUANTUM = 16384
+
+
+def pad_traffic_bytes(raw_bytes: bytes) -> bytes:
+    """Pad UTF-8/binary message bytes to fixed traffic-analysis-resistant buckets."""
+    if not isinstance(raw_bytes, (bytes, bytearray)):
+        raise TypeError("Expected bytes")
+    raw = bytes(raw_bytes)
+    needed = PADDING_HEADER_LEN + len(raw)
+    target = 0
+    for bucket in TRAFFIC_PAD_BUCKETS:
+        if needed <= bucket:
+            target = bucket
+            break
+    if target == 0:
+        rem = needed % LARGE_PAD_QUANTUM
+        target = needed if rem == 0 else needed + (LARGE_PAD_QUANTUM - rem)
+    pad_len = target - needed
+    return PADDING_MAGIC + struct.pack(">I", len(raw)) + raw + (b"\x00" * pad_len)
+
+
+def unpad_traffic_bytes(decrypted_bytes: bytes) -> bytes:
+    """Strip bucket padding; seamlessly accepts pre-padding legacy payloads."""
+    if not isinstance(decrypted_bytes, (bytes, bytearray)):
+        raise TypeError("Expected bytes")
+    buf = bytes(decrypted_bytes)
+    if len(buf) >= PADDING_HEADER_LEN and buf[:5] == PADDING_MAGIC:
+        (real_len,) = struct.unpack(">I", buf[5:9])
+        end = PADDING_HEADER_LEN + real_len
+        if end > len(buf):
+            raise ValueError("Invalid padded payload length")
+        tail = buf[end:]
+        if any(tail):
+            raise ValueError("Non-zero padding tail")
+        return buf[PADDING_HEADER_LEN:end]
+    return buf
 
 
 class CryptoManager:
@@ -26,8 +67,17 @@ class CryptoManager:
         return self.private_key.encode(encoder=Base64Encoder).decode('utf-8')
 
     def load_private_key(self, b64_key: str):
-        self.private_key = SigningKey(b64_key.encode('utf-8'), encoder=Base64Encoder)
+        if not isinstance(b64_key, str) or not b64_key.strip():
+            raise ValueError("Некорректный приватный ключ")
+        raw = Base64Encoder.decode(b64_key.strip().encode('utf-8'))
+        if len(raw) != 32:
+            raise ValueError("Некорректная длина приватного ключа")
+        self.private_key = SigningKey(raw)
         self.public_key = self.private_key.verify_key
+
+    def clear(self):
+        self.private_key = None
+        self.public_key = None
 
     def get_fingerprint(self) -> str:
         if not self.public_key:
@@ -53,7 +103,8 @@ class CryptoManager:
         receiver_curve_pub = receiver_verify_key.to_curve25519_public_key()
         my_curve_priv = self.private_key.to_curve25519_private_key()
         crypto_box = Box(my_curve_priv, receiver_curve_pub)
-        encrypted_bytes = crypto_box.encrypt(plaintext.encode('utf-8'))
+        padded_plaintext = pad_traffic_bytes(plaintext.encode('utf-8'))
+        encrypted_bytes = crypto_box.encrypt(padded_plaintext)
         signature_bytes = self.private_key.sign(encrypted_bytes).signature
         return {
             "encrypted_blob": Base64Encoder.encode(encrypted_bytes).decode('utf-8'),
@@ -69,24 +120,37 @@ class CryptoManager:
         crypto_box = Box(my_curve_priv, sender_curve_pub)
         encrypted_bytes = Base64Encoder.decode(ciphertext_b64.encode('utf-8'))
         decrypted_bytes = crypto_box.decrypt(encrypted_bytes)
-        return decrypted_bytes.decode('utf-8')
+        return unpad_traffic_bytes(decrypted_bytes).decode('utf-8')
 
     def generate_file_key(self) -> str:
         key = nacl.utils.random(SecretBox.KEY_SIZE)
         return Base64Encoder.encode(key).decode('utf-8')
 
     def encrypt_file(self, file_data: bytes, key_b64: str) -> bytes:
-        key_bytes = Base64Encoder.decode(key_b64.encode('utf-8'))
+        if not isinstance(file_data, (bytes, bytearray)):
+            raise ValueError("Некорректные данные файла")
+        if not isinstance(key_b64, str) or not key_b64.strip():
+            raise ValueError("Некорректный ключ шифрования файла")
+        key_bytes = Base64Encoder.decode(key_b64.strip().encode('utf-8'))
+        if len(key_bytes) != SecretBox.KEY_SIZE:
+            raise ValueError("Некорректная длина ключа файла")
         box = SecretBox(key_bytes)
         nonce = nacl.utils.random(SecretBox.NONCE_SIZE)
-        encrypted = box.encrypt(file_data, nonce)
+        encrypted = box.encrypt(bytes(file_data), nonce)
         return bytes(encrypted)
 
     def decrypt_file(self, encrypted_data: bytes, key_b64: str) -> bytes:
+        if (not isinstance(encrypted_data, (bytes, bytearray))
+                or len(encrypted_data) < SecretBox.NONCE_SIZE + SecretBox.MACBYTES):
+            raise ValueError("Повреждённый или пустой зашифрованный файл")
+        if not isinstance(key_b64, str) or not key_b64.strip():
+            raise ValueError("Некорректный ключ расшифровки файла")
         clean_key = key_b64.strip()
         key_bytes = Base64Encoder.decode(clean_key.encode('utf-8'))
+        if len(key_bytes) != SecretBox.KEY_SIZE:
+            raise ValueError("Некорректная длина ключа файла")
         box = SecretBox(key_bytes)
-        return box.decrypt(encrypted_data)
+        return box.decrypt(bytes(encrypted_data))
 
 
 crypto = CryptoManager()
