@@ -106,11 +106,30 @@ $env:CALL_STUN_URLS = "stun:stun.cloudflare.com:3478"
 & $PyExe -c "import pathlib, secrets; p = pathlib.Path('.env'); (p.exists() and len(p.read_text(encoding='utf-8')) >= 40) or p.write_text('SECRET_KEY=' + secrets.token_hex(32) + '\n', encoding='utf-8')"
 
 Write-Host ""
+$TunnelUrl = Read-Host "Optional: paste HTTPS tunnel URL to generate 1-click max1m-join:// links (or press Enter to skip)"
+$TunnelUrl = $TunnelUrl.Trim()
+
+Write-Host ""
 Write-Host "=================================================================" -ForegroundColor Cyan
 Write-Host "  Generating 2 fresh invite codes for Window #1 and Window #2:" -ForegroundColor Cyan
 Write-Host "=================================================================" -ForegroundColor Cyan
-& $PyExe create_invite.py
-& $PyExe create_invite.py
+$Out1 = (& $PyExe create_invite.py | Out-String)
+$Out2 = (& $PyExe create_invite.py | Out-String)
+Write-Host $Out1
+Write-Host $Out2
+
+if ($TunnelUrl -match "^https://") {
+    $GenScript = Join-Path $RepoRoot "deploy\generate_join_link.py"
+    $Inv1 = if ($Out1 -match "(MAX1M-[A-Z0-9-]+)") { $Matches[1] } else { "" }
+    $Inv2 = if ($Out2 -match "(MAX1M-[A-Z0-9-]+)") { $Matches[1] } else { "" }
+    Write-Host "=================================================================" -ForegroundColor Yellow
+    Write-Host "  1-CLICK max1m-join:// STRINGS (paste into Max1m -> Apply):" -ForegroundColor Yellow
+    Write-Host "=================================================================" -ForegroundColor Yellow
+    Write-Host "[Window #1]:" -ForegroundColor Cyan
+    & $PyExe $GenScript --server $TunnelUrl --invite $Inv1
+    Write-Host "[Window #2]:" -ForegroundColor Cyan
+    & $PyExe $GenScript --server $TunnelUrl --invite $Inv2
+}
 
 Write-Host ""
 Write-Host "=================================================================" -ForegroundColor Green
