@@ -37,8 +37,12 @@ try:
     import pyaudio
     PYAUDIO_AVAILABLE = True
 except ImportError:
-    pyaudio = None
-    PYAUDIO_AVAILABLE = False
+    try:
+        import pyaudiowpatch as pyaudio
+        PYAUDIO_AVAILABLE = True
+    except ImportError:
+        pyaudio = None
+        PYAUDIO_AVAILABLE = False
 
 try:
     from av.audio.frame import AudioFrame

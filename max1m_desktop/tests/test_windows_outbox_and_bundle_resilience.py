@@ -152,3 +152,44 @@ def test_encrypt_durable_personal_falls_back_to_nacl_box_if_double_ratchet_unava
     assert bob.verify_signature(att_res["encrypted_blob"], att_res["signature"], alice.get_public_key_b64())
     dec_att = bob.decrypt_message(att_res["encrypted_blob"], alice.get_public_key_b64())
     assert json.loads(dec_att)["type"] == "image"
+
+
+def test_latest_python_314_315_windows_wheels_and_pyaudiowpatch_fallback():
+    repo_root = Path(__file__).resolve().parents[2]
+    desk_req = (repo_root / "max1m_desktop" / "requirements.txt").read_text(encoding="utf-8")
+    back_req = (repo_root / "max1m_backend" / "requirements.txt").read_text(encoding="utf-8")
+
+    # Latest Python 3.14 & 3.15 binary wheel markers
+    assert 'PySide6==6.12.0 ; python_version >= "3.15"' in desk_req
+    assert 'PyAudioWPatch==0.2.12.9 ; python_version >= "3.14" and sys_platform == "win32"' in desk_req
+    assert 'av==19.0.2 ; python_version >= "3.15"' in desk_req
+    assert "uvicorn==0.54.0" in back_req
+    assert "uvicorn[standard]" not in back_req
+
+    # All three desktop audio entrypoints fall back cleanly to pyaudiowpatch
+    for rel in (
+        "max1m_desktop/app/windows/main_screen.py",
+        "max1m_desktop/app/webrtc_manager.py",
+        "max1m_desktop/app/group_voice_room.py",
+    ):
+        src = (repo_root / rel).read_text(encoding="utf-8")
+        assert "import pyaudiowpatch as pyaudio" in src, f"Missing pyaudiowpatch fallback in {rel}"
+
+    # All Windows .ps1/.bat scripts remain 100% ASCII + CRLF and support Python 3.15/3.14 auto-upgrade
+    for rel in (
+        "packaging/build_windows.ps1",
+        "packaging/start_local_server.ps1",
+        "packaging/start_two_windows.ps1",
+        "build_windows_exe.bat",
+        "run_local_test_server.bat",
+        "run_two_windows.bat",
+    ):
+        raw = (repo_root / rel).read_bytes()
+        assert all(b < 128 for b in raw), f"Non-ASCII byte in {rel}"
+        assert b"\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b""), f"Non-CRLF line ending in {rel}"
+
+    build_ps1 = (repo_root / "packaging" / "build_windows.ps1").read_text(encoding="ascii")
+    assert '"-3.15", "-3.14", "-3.13", "-3.12"' in build_ps1
+    assert "pyinstaller==6.22.3" in build_ps1
+    assert "ExistingVenvVer -ne $TargetVer" in build_ps1
+

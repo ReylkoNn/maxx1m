@@ -1,13 +1,19 @@
-# Direct runtime dependencies (supports Python 3.10 – 3.13 with prebuilt Windows x64 wheels).
-PySide6==6.11.3
+# Direct runtime dependencies (supports Python 3.10 – 3.15 with 100% prebuilt Windows x64 wheels).
+PySide6==6.12.0 ; python_version >= "3.15"
+PySide6==6.11.3 ; python_version < "3.15"
 PyNaCl==1.6.2
+argon2-cffi==25.1.0
 keyring==25.7.0
 requests==2.34.2
 websockets==17.4 ; python_version >= "3.11"
 websockets==16.1.1 ; python_version < "3.11"
-aiortc==1.14.0
-av==16.1.0
-numpy==2.4.6 ; python_version >= "3.11"
+aiortc==1.16.0 ; python_version >= "3.15"
+aiortc==1.14.0 ; python_version < "3.15"
+av==19.0.2 ; python_version >= "3.15"
+av==16.1.0 ; python_version < "3.15"
+numpy==2.5.4 ; python_version >= "3.15"
+numpy==2.4.6 ; python_version >= "3.11" and python_version < "3.15"
 numpy==2.2.6 ; python_version < "3.11"
-PyAudio==0.2.14
+PyAudio==0.2.14 ; python_version < "3.14" or sys_platform != "win32"
+PyAudioWPatch==0.2.12.9 ; python_version >= "3.14" and sys_platform == "win32"
 mss==10.1.0

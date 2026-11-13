@@ -2,7 +2,13 @@ import time
 import math
 import threading
 import random
-import pyaudio
+try:
+    import pyaudio
+except ImportError:
+    try:
+        import pyaudiowpatch as pyaudio
+    except ImportError:
+        pyaudio = None
 import wave
 import io
 import json

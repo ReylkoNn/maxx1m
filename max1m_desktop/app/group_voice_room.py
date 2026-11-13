@@ -644,7 +644,10 @@ class GroupVoiceRoomController:
         try:
             import pyaudio
         except ImportError:
-            pyaudio = None
+            try:
+                import pyaudiowpatch as pyaudio
+            except ImportError:
+                pyaudio = None
         if pyaudio is None or not hasattr(pyaudio, "PyAudio"):
             return
         try:

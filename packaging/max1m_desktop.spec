@@ -131,6 +131,8 @@ hiddenimports = [
     "mss",
     "mss.windows",
     "pyaudio",
+    "pyaudiowpatch",
+    "_portaudiowpatch",
     "websockets",
     "requests",
     "urllib3",

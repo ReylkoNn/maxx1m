@@ -1,5 +1,7 @@
 # =============================================================================
 # Max1m - Local test backend starter for tunnel / 2-window testing (port 8000)
+# Automatically picks the NEWEST installed Python (3.15 -> 3.14 -> 3.13 -> 3.12)
+# and upgrades <Drive>:\.m1b\bv when a newer Python version is installed.
 # =============================================================================
 $ErrorActionPreference = "Continue"
 
@@ -35,67 +37,95 @@ function Resolve-ShortBuildRoot {
     return (Join-Path $BaseDir ".m1b")
 }
 
+function Get-PythonVersionTag {
+    param([string]$ExePath)
+    if (-not $ExePath -or -not (Test-Path $ExePath)) { return "" }
+    if ($ExePath -match "WindowsApps") { return "" }
+    try {
+        $out = & $ExePath -c "import sys, struct; assert struct.calcsize('P') == 8 and (3, 10) <= sys.version_info[:2] < (3, 16); print(f'{sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}')" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $out) {
+            return ($out | Select-Object -Last 1).ToString().Trim()
+        }
+    } catch {}
+    return ""
+}
+
 function Resolve-BackendPython {
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        foreach ($ver in @("-3.15", "-3.14", "-3.13", "-3.12", "-3.11", "-3.10")) {
+            try {
+                $out = & py $ver -c "import sys; print(sys.executable)" 2>$null
+                if ($LASTEXITCODE -eq 0 -and $out) {
+                    $trimmed = ($out | Select-Object -Last 1).ToString().Trim()
+                    if ((Get-PythonVersionTag -ExePath $trimmed) -ne "") { return $trimmed }
+                }
+            } catch {}
+        }
+    }
+
     $candidates = @(
-        (Join-Path $BackendDir ".venv\Scripts\python.exe"),
-        (Join-Path $BackendDir "venv\Scripts\python.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python315\python.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python314\python.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\python.exe"),
         (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"),
         (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"),
         (Join-Path $env:LOCALAPPDATA "Programs\Python\Python310\python.exe"),
-        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\python.exe"),
+        (Join-Path $env:ProgramFiles "Python315\python.exe"),
+        (Join-Path $env:ProgramFiles "Python314\python.exe"),
+        (Join-Path $env:ProgramFiles "Python313\python.exe"),
+        (Join-Path $env:ProgramFiles "Python312\python.exe"),
+        (Join-Path $env:ProgramFiles "Python311\python.exe"),
+        (Join-Path $env:ProgramFiles "Python310\python.exe"),
+        "C:\Python315\python.exe",
+        "C:\Python314\python.exe",
+        "C:\Python313\python.exe",
         "C:\Python312\python.exe",
         "C:\Python311\python.exe",
-        "C:\Python310\python.exe",
-        "C:\Python313\python.exe"
+        "C:\Python310\python.exe"
     )
     foreach ($p in $candidates) {
-        if ($p -and (Test-Path $p)) { return $p }
+        if ((Get-PythonVersionTag -ExePath $p) -ne "") { return $p }
     }
-    if (Get-Command py -ErrorAction SilentlyContinue) {
-        foreach ($ver in @("-3.12", "-3.11", "-3.10", "-3.13")) {
-            $out = & py $ver -c "import sys; print(sys.executable)"
+
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        try {
+            $out = & python -c "import sys; print(sys.executable)" 2>$null
             if ($LASTEXITCODE -eq 0 -and $out) {
                 $trimmed = ($out | Select-Object -Last 1).ToString().Trim()
-                if (Test-Path $trimmed) { return $trimmed }
+                if ((Get-PythonVersionTag -ExePath $trimmed) -ne "") { return $trimmed }
             }
-        }
-    }
-    if (Get-Command python -ErrorAction SilentlyContinue) {
-        $out = & python -c "import sys; print(sys.executable)"
-        if ($LASTEXITCODE -eq 0 -and $out) {
-            $trimmed = ($out | Select-Object -Last 1).ToString().Trim()
-            if (Test-Path $trimmed) { return $trimmed }
-        }
+        } catch {}
     }
     return $null
 }
 
+$BasePy = Resolve-BackendPython
+if (-not $BasePy) {
+    Write-Host "[ERROR] 64-bit Python 3.10 - 3.15 was not found." -ForegroundColor Red
+    exit 1
+}
+
+$TargetVer    = Get-PythonVersionTag -ExePath $BasePy
 $ShortRoot    = Resolve-ShortBuildRoot -BaseDir $RepoRoot
 $ShortVenvDir = Join-Path $ShortRoot "bv"
 $ShortVenvPy  = Join-Path $ShortVenvDir "Scripts\python.exe"
-$LocalVenvPy  = Join-Path $BackendDir ".venv\Scripts\python.exe"
-$LegacyVenvPy = Join-Path $BackendDir "venv\Scripts\python.exe"
 
-if (Test-Path $ShortVenvPy) {
-    $PyExe = $ShortVenvPy
-} elseif (Test-Path $LocalVenvPy) {
-    $PyExe = $LocalVenvPy
-} elseif (Test-Path $LegacyVenvPy) {
-    $PyExe = $LegacyVenvPy
-} else {
-    $BasePy = Resolve-BackendPython
-    if (-not $BasePy) {
-        Write-Host "[ERROR] Python 3.10-3.13 was not found." -ForegroundColor Red
-        exit 1
-    }
-    Write-Host "[1/3] Creating short-path backend virtualenv: $ShortVenvDir ..." -ForegroundColor Cyan
+$ExistingVenvVer = Get-PythonVersionTag -ExePath $ShortVenvPy
+if ((Test-Path $ShortVenvDir) -and ($ExistingVenvVer -ne $TargetVer)) {
+    Write-Host "[INFO] Upgrading backend virtualenv from Python '$ExistingVenvVer' to Python '$TargetVer' ..." -ForegroundColor Yellow
+    Remove-Item -Recurse -Force $ShortVenvDir -ErrorAction SilentlyContinue
+}
+
+if (-not (Test-Path $ShortVenvPy)) {
+    Write-Host "[1/3] Creating short-path backend virtualenv ($TargetVer): $ShortVenvDir ..." -ForegroundColor Cyan
     & $BasePy -m venv $ShortVenvDir
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    $PyExe = $ShortVenvPy
-    & $PyExe -m pip install --upgrade pip wheel
-    & $PyExe -m pip install -r (Join-Path $BackendDir "requirements.txt")
+    & $ShortVenvPy -m pip install --upgrade pip wheel
+    & $ShortVenvPy -m pip install -r (Join-Path $BackendDir "requirements.txt")
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
+
+$PyExe = $ShortVenvPy
 
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
@@ -133,7 +163,7 @@ if ($TunnelUrl -match "^https://") {
 
 Write-Host ""
 Write-Host "=================================================================" -ForegroundColor Green
-Write-Host "  Starting Max1m server on http://127.0.0.1:8000" -ForegroundColor Green
+Write-Host "  Starting Max1m server on http://127.0.0.1:8000 (Python $TargetVer)" -ForegroundColor Green
 Write-Host "  Point your HTTPS tunnel to port 8000 (e.g. cloudflared / tuna)"
 Write-Host "=================================================================" -ForegroundColor Green
 & $PyExe run_server.py
