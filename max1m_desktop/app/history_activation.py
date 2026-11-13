@@ -100,6 +100,11 @@ def write_catalog(path, key, owner, chats):
     encrypted = bytes(nacl.secret.SecretBox(key).encrypt(payload))
     if len(encrypted) > MAX_CATALOG_BYTES:
         raise ValueError('History catalog exceeds size limit')
+    from app.secure_storage import (
+        _atomic_replace_file,
+        _safe_fsync_fd,
+        _unlink_temp_quietly,
+    )
     temp = None
     try:
         with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as f:
@@ -111,13 +116,12 @@ def write_catalog(path, key, owner, chats):
                     pass
             f.write(encrypted)
             f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp, path)
+            _safe_fsync_fd(f.fileno())
+        _atomic_replace_file(temp, path)
         temp = None
         _fsync_directory(path.parent)
     finally:
-        if temp and os.path.exists(temp):
-            os.unlink(temp)
+        _unlink_temp_quietly(temp)
 
 
 def _same_source(source, expected, cancel=None):

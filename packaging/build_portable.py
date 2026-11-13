@@ -12,6 +12,7 @@ Includes:
 from __future__ import annotations
 
 import dis
+import hashlib
 import inspect
 import os
 import platform
@@ -50,6 +51,18 @@ def _patch_cpython_310_dis_bug() -> None:
 
         _safe_name._max1m_patched = True  # type: ignore[attr-defined]
         dis._get_name_info = _safe_name  # type: ignore[attr-defined]
+
+    orig_cmp = getattr(dis, "cmp_op", None)
+    if isinstance(orig_cmp, tuple) and not getattr(orig_cmp, "_max1m_patched", False):
+        class _SafeCmpOpTuple(tuple):
+            _max1m_patched = True
+
+            def __getitem__(self, item):  # type: ignore[override]
+                if isinstance(item, int) and not (0 <= item < len(self)):
+                    return f"<{item}>"
+                return super().__getitem__(item)
+
+        dis.cmp_op = _SafeCmpOpTuple(orig_cmp)  # type: ignore[assignment]
 
     try:
         import PyInstaller.lib.modulegraph.util as mg_util
@@ -138,6 +151,9 @@ def build_bundle() -> Path:
     bundle_dir = pyi_dist_dir / "Max1m"
     if not bundle_dir.is_dir():
         raise RuntimeError(f"Expected output folder not found: {bundle_dir}")
+
+    spec_stamp = hashlib.sha256(spec_file.read_bytes()).hexdigest()[:16]
+    (bundle_dir / "_build_stamp.txt").write_text(spec_stamp + "\n", encoding="ascii")
 
     two_inst_bat = pkg_dir / "launch_two_instances.bat"
     if two_inst_bat.is_file():

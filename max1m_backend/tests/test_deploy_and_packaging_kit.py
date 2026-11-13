@@ -124,3 +124,78 @@ def test_pyinstaller_windows_packaging_kit_structure():
         assert all(b < 128 for b in raw), f"Non-ASCII byte in {scr} breaks cmd.exe / PowerShell 5.1!"
         assert b"chcp 65001" not in raw.lower()
 
+
+def test_pyinstaller_spec_ast_discovers_all_app_modules_and_310_cmp_op_guard():
+    import ast
+    import dis
+
+    bp_mod = _load_module(REPO_ROOT / "packaging" / "build_portable.py", "build_portable_test")
+    bp_mod._patch_cpython_310_dis_bug()
+    assert dis.cmp_op[999] == "<999>"
+
+    spec_path = REPO_ROOT / "packaging" / "max1m_desktop.spec"
+    spec_src = spec_path.read_text(encoding="utf-8")
+    tree = ast.parse(spec_src, filename=str(spec_path))
+
+    # Execute only the helper + constants prior to Analysis(...) so PyInstaller isn't required in backend venv
+    prefix_nodes = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "a" for t in node.targets
+        ):
+            break
+        prefix_nodes.append(node)
+
+    ns = {
+        "SPECPATH": str(spec_path.parent),
+        "__file__": str(spec_path),
+    }
+    # Provide stub PyInstaller.utils.hooks if PyInstaller is not installed in backend test venv
+    import sys
+    import types
+
+    saved_pyi = sys.modules.get("PyInstaller")
+    saved_hooks = sys.modules.get("PyInstaller.utils.hooks")
+    if saved_hooks is None:
+        pyi_pkg = types.ModuleType("PyInstaller")
+        pyi_utils = types.ModuleType("PyInstaller.utils")
+        pyi_hooks = types.ModuleType("PyInstaller.utils.hooks")
+        pyi_hooks.collect_data_files = lambda *_a, **_k: []
+        pyi_hooks.collect_submodules = lambda *_a, **_k: []
+        sys.modules["PyInstaller"] = pyi_pkg
+        sys.modules["PyInstaller.utils"] = pyi_utils
+        sys.modules["PyInstaller.utils.hooks"] = pyi_hooks
+    try:
+        exec(compile(ast.Module(body=prefix_nodes, type_ignores=[]), str(spec_path), "exec"), ns)
+    finally:
+        if saved_hooks is None:
+            sys.modules.pop("PyInstaller.utils.hooks", None)
+            sys.modules.pop("PyInstaller.utils", None)
+            if saved_pyi is None:
+                sys.modules.pop("PyInstaller", None)
+
+    hidden = set(ns["hiddenimports"])
+    expected_app_modules = {
+        "app.double_ratchet",
+        "app.media_identity",
+        "app.group_voice_room",
+        "app.screen_share",
+        "app.ice_config",
+        "app.local_vault",
+        "app.onboarding",
+        "app.tls_pinning",
+        "app.outbox",
+        "app.outbox_policy",
+        "app.attachment_outbox",
+        "app.secure_storage",
+        "app.windows.main_screen",
+        "app.windows.app_window",
+        "app.windows.settings_screen",
+        "app.windows.widgets.screen_share_overlay",
+        "sqlite3",
+        "_sqlite3",
+    }
+    missing = expected_app_modules - hidden
+    assert not missing, f"Missing critical modules from max1m_desktop.spec hiddenimports: {missing}"
+
+

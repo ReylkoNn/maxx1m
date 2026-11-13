@@ -1,6 +1,9 @@
 import keyring
 import json
 import base64
+import errno
+import hashlib
+import time
 import uuid
 import os
 import tempfile
@@ -19,7 +22,7 @@ _CUSTOM_CLIENT_DIR = os.environ.get("MAX1M_CLIENT_DATA_DIR", "").strip()
 
 if _CUSTOM_CLIENT_DIR:
     BASE_DIR = Path(_CUSTOM_CLIENT_DIR).expanduser().resolve()
-    _inst_tag = _RAW_INST or hashlib.sha256(str(BASE_DIR).encode("utf-8")).hexdigest()[:8] if "hashlib" in globals() else (_RAW_INST or "custom")
+    _inst_tag = _RAW_INST or hashlib.sha256(str(BASE_DIR).encode("utf-8")).hexdigest()[:8]
     SERVICE_NAME = f"Max1m_Secure_Messenger__{_inst_tag}"
 elif _RAW_INST and _RAW_INST != "1":
     BASE_DIR = Path.home() / f".max1m_inst_{_RAW_INST}"
@@ -73,6 +76,49 @@ def _fsync_directory(directory: Path) -> None:
                 os.close(fd)
             except OSError:
                 pass
+
+
+def _safe_fsync_fd(fd: int) -> None:
+    """Flush file descriptor to storage; tolerate Windows filter/volume quirks after flush()."""
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        winerr = getattr(exc, "winerror", None)
+        if os.name == "nt" and (exc.errno == errno.EINVAL or winerr in (1, 5, 6, 50, 87)):
+            return
+        raise
+
+
+def _atomic_replace_file(src: str | Path, dst: str | Path) -> None:
+    """
+    Atomically replace `dst` with `src`, retrying brief Windows Defender (`WdFilter.sys`)
+    or indexer sharing locks (`WinError 5` / `WinError 32` / `EACCES`) on newly closed files.
+    """
+    delays = (0.005, 0.01, 0.02, 0.03, 0.05, 0.07, 0.1, 0.12)
+    for attempt in range(len(delays) + 1):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as exc:
+            winerr = getattr(exc, "winerror", None)
+            retryable = isinstance(exc, PermissionError) or exc.errno == errno.EACCES or winerr in (5, 32)
+            if not retryable or attempt >= len(delays):
+                raise
+            time.sleep(delays[attempt])
+
+
+def _unlink_temp_quietly(temp_path: str | Path | None) -> None:
+    """Best-effort cleanup of a leftover temp file in `finally:` without masking outcomes."""
+    if not temp_path:
+        return
+    for delay in (0.0, 0.01, 0.03):
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            return
+        except OSError:
+            if delay:
+                time.sleep(delay)
 
 
 # Fixed-size lock striping avoids an unbounded lock map. A whole profile is
@@ -312,14 +358,13 @@ class SecureStorage:
                 temp_name = f.name
                 json.dump(to_write, f, indent=4)
                 f.flush()
-                os.fsync(f.fileno())
+                _safe_fsync_fd(f.fileno())
             _restrict_file_permissions(Path(temp_name))
-            os.replace(temp_name, CONFIG_FILE)
+            _atomic_replace_file(temp_name, CONFIG_FILE)
             _restrict_file_permissions(CONFIG_FILE)
             _fsync_directory(BASE_DIR)
         finally:
-            if temp_name and os.path.exists(temp_name):
-                os.unlink(temp_name)
+            _unlink_temp_quietly(temp_name)
 
     @staticmethod
     def load_local_state() -> dict:
@@ -387,12 +432,11 @@ class SecureStorage:
                 temp_name = f.name
                 f.write(encrypted)
                 f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp_name, enc_file)
+                _safe_fsync_fd(f.fileno())
+            _atomic_replace_file(temp_name, enc_file)
             _fsync_directory(enc_file.parent)
         finally:
-            if temp_name and os.path.exists(temp_name):
-                os.unlink(temp_name)
+            _unlink_temp_quietly(temp_name)
 
     @staticmethod
     @_profile_locked
@@ -490,12 +534,11 @@ class SecureStorage:
                 temp_name = f.name
                 f.write(encrypted)
                 f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp_name, path)
+                _safe_fsync_fd(f.fileno())
+            _atomic_replace_file(temp_name, path)
             _fsync_directory(path.parent)
         finally:
-            if temp_name and os.path.exists(temp_name):
-                os.unlink(temp_name)
+            _unlink_temp_quietly(temp_name)
 
     @staticmethod
     @_profile_locked
@@ -576,12 +619,11 @@ class SecureStorage:
                 temp_name = f.name
                 f.write(encrypted)
                 f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp_name, groups_file)
+                _safe_fsync_fd(f.fileno())
+            _atomic_replace_file(temp_name, groups_file)
             _fsync_directory(groups_file.parent)
         finally:
-            if temp_name and os.path.exists(temp_name):
-                os.unlink(temp_name)
+            _unlink_temp_quietly(temp_name)
 
     @staticmethod
     @_profile_locked
@@ -662,14 +704,13 @@ class SecureStorage:
                 temp_name = f.name
                 f.write(encrypted)
                 f.flush()
-                os.fsync(f.fileno())
+                _safe_fsync_fd(f.fileno())
             _restrict_file_permissions(Path(temp_name))
-            os.replace(temp_name, keys_file)
+            _atomic_replace_file(temp_name, keys_file)
             _restrict_file_permissions(keys_file)
             _fsync_directory(keys_file.parent)
         finally:
-            if temp_name and os.path.exists(temp_name):
-                os.unlink(temp_name)
+            _unlink_temp_quietly(temp_name)
 
     @staticmethod
     @_profile_locked
@@ -743,14 +784,13 @@ class SecureStorage:
                 temp_name = f.name
                 f.write(encrypted)
                 f.flush()
-                os.fsync(f.fileno())
+                _safe_fsync_fd(f.fileno())
             _restrict_file_permissions(Path(temp_name))
-            os.replace(temp_name, pins_file)
+            _atomic_replace_file(temp_name, pins_file)
             _restrict_file_permissions(pins_file)
             _fsync_directory(pins_file.parent)
         finally:
-            if temp_name and os.path.exists(temp_name):
-                os.unlink(temp_name)
+            _unlink_temp_quietly(temp_name)
 
         # Mirror to local_state.json so pre-login /auth/login requests also enforce the pin!
         try:
@@ -804,12 +844,11 @@ class SecureStorage:
                 temp_name = f.name
                 f.write(box.encrypt(json_data))
                 f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp_name, messages_file)
+                _safe_fsync_fd(f.fileno())
+            _atomic_replace_file(temp_name, messages_file)
             _fsync_directory(messages_file.parent)
         finally:
-            if temp_name and os.path.exists(temp_name):
-                os.unlink(temp_name)
+            _unlink_temp_quietly(temp_name)
 
     @staticmethod
     @_profile_locked
@@ -1236,14 +1275,13 @@ class SecureStorage:
                 temp_name = f.name
                 f.write(encrypted)
                 f.flush()
-                os.fsync(f.fileno())
+                _safe_fsync_fd(f.fileno())
             _restrict_file_permissions(Path(temp_name))
-            os.replace(temp_name, prefs_file)
+            _atomic_replace_file(temp_name, prefs_file)
             _fsync_directory(pdir)
             return True
         finally:
-            if temp_name and os.path.exists(temp_name):
-                os.unlink(temp_name)
+            _unlink_temp_quietly(temp_name)
 
     @staticmethod
     @_profile_locked

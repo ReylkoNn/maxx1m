@@ -3620,48 +3620,61 @@ class MainScreen(QFrame):
                 raise
             return True
         except Exception as e:
-            print(f"[SEND] Ошибка подготовки: {type(e).__name__}")
+            err_type = type(e).__name__
+            print(f"[SEND] Ошибка подготовки: {err_type}")
             if durable:
-                QMessageBox.warning(self, "Сообщение не отправлено", "Не удалось сохранить сообщение в очередь или контакт изменился.")
+                QMessageBox.warning(
+                    self,
+                    "Сообщение не отправлено",
+                    f"Не удалось сохранить сообщение в очередь или контакт изменился. ({err_type})",
+                )
             return False
 
     def _encrypt_durable_personal(self, context, payload_dict: dict, msg_type: str) -> dict:
-        from app.double_ratchet import encrypt_personal_envelope
-
         pt_json = json.dumps(payload_dict, ensure_ascii=False)
-        env, used_dr = encrypt_personal_envelope(
-            owner_username=context.owner_username,
-            owner_device_id=context.owner_device_id,
-            crypto_mgr=crypto,
-            recipient_device_id=context.device_id,
-            recipient_pub_b64=context.public_key,
-            plaintext=pt_json,
-            msg_kind=msg_type,
-        )
-        if not used_dr:
-            self._ensure_peer_ratchet_session(context)
-        return env
+        try:
+            from app.double_ratchet import encrypt_personal_envelope
+
+            env, used_dr = encrypt_personal_envelope(
+                owner_username=context.owner_username,
+                owner_device_id=context.owner_device_id,
+                crypto_mgr=crypto,
+                recipient_device_id=context.device_id,
+                recipient_pub_b64=context.public_key,
+                plaintext=pt_json,
+                msg_kind=msg_type,
+            )
+            if not used_dr:
+                self._ensure_peer_ratchet_session(context)
+            return env
+        except Exception as dr_exc:
+            print(f"[DR] Fallback to NaCl Box for {msg_type}: {type(dr_exc).__name__}")
+            return crypto.encrypt_message(pt_json, context.public_key)
 
     def _encrypt_attachment_personal(
         self, context, message_dict: dict, kind: str, file_id: str, secret_key: str, msg_id: str
     ) -> dict:
-        from app.double_ratchet import attachment_commitment, encrypt_personal_envelope
-
         pt_json = json.dumps(message_dict, ensure_ascii=False)
-        att_commit = attachment_commitment(file_id, secret_key, msg_id)
-        env, used_dr = encrypt_personal_envelope(
-            owner_username=context.owner_username,
-            owner_device_id=context.owner_device_id,
-            crypto_mgr=crypto,
-            recipient_device_id=context.device_id,
-            recipient_pub_b64=context.public_key,
-            plaintext=pt_json,
-            msg_kind=kind,
-            attachment_commit=att_commit,
-        )
-        if not used_dr:
-            self._ensure_peer_ratchet_session(context)
-        return env
+        try:
+            from app.double_ratchet import attachment_commitment, encrypt_personal_envelope
+
+            att_commit = attachment_commitment(file_id, secret_key, msg_id)
+            env, used_dr = encrypt_personal_envelope(
+                owner_username=context.owner_username,
+                owner_device_id=context.owner_device_id,
+                crypto_mgr=crypto,
+                recipient_device_id=context.device_id,
+                recipient_pub_b64=context.public_key,
+                plaintext=pt_json,
+                msg_kind=kind,
+                attachment_commit=att_commit,
+            )
+            if not used_dr:
+                self._ensure_peer_ratchet_session(context)
+            return env
+        except Exception as dr_exc:
+            print(f"[DR] Attachment fallback to NaCl Box for {kind}: {type(dr_exc).__name__}")
+            return crypto.encrypt_message(pt_json, context.public_key)
 
     def sync_own_prekey_bundle(self):
         account = (state.username, state.server_url, state.device_id, state.token)
@@ -7596,6 +7609,9 @@ class MainScreen(QFrame):
         if state.current_chat_type == "group" and state.current_group_id:
             self._send_group_control_text(state.current_group_id, f"[EDIT_MSG]|{edit_id}|{new_text}")
         elif state.current_chat_type == "ally" and state.current_chat_username:
+            if getattr(state, "current_chat_device_id", None) and callable(getattr(self, "_verify_call_contact", None)):
+                if not self._verify_call_contact(state.current_chat_username, state.current_chat_device_id):
+                    return
             self._send_system_payload(
                 state.current_chat_username,
                 {"type": "edit_msg", "msg_id": edit_id, "new_text": new_text},
@@ -7616,6 +7632,9 @@ class MainScreen(QFrame):
         if state.current_chat_type == "group" and state.current_group_id:
             self._send_group_control_text(state.current_group_id, f"[PIN_MSG]|{msg_id}|{clean_prev}")
         elif state.current_chat_type == "ally" and state.current_chat_username:
+            if getattr(state, "current_chat_device_id", None) and callable(getattr(self, "_verify_call_contact", None)):
+                if not self._verify_call_contact(state.current_chat_username, state.current_chat_device_id):
+                    return
             self._send_system_payload(
                 state.current_chat_username,
                 {"type": "pin_msg", "msg_id": msg_id, "preview": clean_prev},
@@ -7633,6 +7652,9 @@ class MainScreen(QFrame):
         if state.current_chat_type == "group" and state.current_group_id:
             self._send_group_control_text(state.current_group_id, "[PIN_MSG]||")
         elif state.current_chat_type == "ally" and state.current_chat_username:
+            if getattr(state, "current_chat_device_id", None) and callable(getattr(self, "_verify_call_contact", None)):
+                if not self._verify_call_contact(state.current_chat_username, state.current_chat_device_id):
+                    return
             self._send_system_payload(
                 state.current_chat_username,
                 {"type": "pin_msg", "msg_id": "", "preview": ""},

@@ -13,7 +13,14 @@ from pathlib import Path
 
 import nacl.secret
 from app import outbox
-from app.secure_storage import SecureStorage, _fsync_directory, _restrict_dir_permissions
+from app.secure_storage import (
+    SecureStorage,
+    _atomic_replace_file,
+    _fsync_directory,
+    _restrict_dir_permissions,
+    _safe_fsync_fd,
+    _unlink_temp_quietly,
+)
 
 MAX_ATTACHMENTS = 50
 MAX_TOTAL_BYTES = 128 * 1024 * 1024
@@ -37,12 +44,11 @@ def _atomic_write(path, data):
             temp = f.name
             f.write(data)
             f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp, path)
+            _safe_fsync_fd(f.fileno())
+        _atomic_replace_file(temp, path)
         _fsync_directory(path.parent)
     finally:
-        if temp and os.path.exists(temp):
-            os.unlink(temp)
+        _unlink_temp_quietly(temp)
 
 
 def enqueue(context, blob, file_id, message_id, payload, history):

@@ -12,7 +12,14 @@ import uuid
 from pathlib import Path
 
 import nacl.secret
-from app.secure_storage import SecureStorage, _fsync_directory, _restrict_dir_permissions
+from app.secure_storage import (
+    SecureStorage,
+    _atomic_replace_file,
+    _fsync_directory,
+    _restrict_dir_permissions,
+    _safe_fsync_fd,
+    _unlink_temp_quietly,
+)
 
 MAX_QUEUED_MESSAGES = 1000
 MAX_ENCRYPTED_RECORD_BYTES = 8 * 1024 * 1024
@@ -96,12 +103,11 @@ def enqueue(username: str, server_url: str, device_id: str, payload: dict, local
             temp_name = output.name
             output.write(encrypted)
             output.flush()
-            os.fsync(output.fileno())
-        os.replace(temp_name, path)
+            _safe_fsync_fd(output.fileno())
+        _atomic_replace_file(temp_name, path)
         _fsync_directory(directory)
     finally:
-        if temp_name and os.path.exists(temp_name):
-            os.unlink(temp_name)
+        _unlink_temp_quietly(temp_name)
     return message_id
 
 
@@ -188,12 +194,11 @@ def mark_send_attempted(path: Path, username: str, server_url: str, device_id: s
             temp_name = output.name
             output.write(encrypted)
             output.flush()
-            os.fsync(output.fileno())
-        os.replace(temp_name, path)
+            _safe_fsync_fd(output.fileno())
+        _atomic_replace_file(temp_name, path)
         _fsync_directory(directory)
     finally:
-        if temp_name and os.path.exists(temp_name):
-            os.unlink(temp_name)
+        _unlink_temp_quietly(temp_name)
 
 
 def cancel_by_local_msg_id(
