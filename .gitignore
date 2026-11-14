@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.idea/
+node_modules/
+# Ignore new local data; already tracked files need separate, careful removal.
+.env
+*.db
+*.db-shm
+*.db-wal
+max1m_backend/secure_uploads/
+deploy/.env
+deploy/turnserver.conf
+packaging/.build_venv/
+packaging/build/
+packaging/dist/

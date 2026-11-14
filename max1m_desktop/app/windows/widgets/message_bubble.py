@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import (
     QFontMetrics, QPixmap, QPainter, QPainterPath,
-    QCursor, QColor, QPen, QIcon
+    QCursor, QColor, QPen, QIcon, QImageReader
 )
 from PySide6.QtSvg import QSvgRenderer
 from pathlib import Path
@@ -13,6 +13,10 @@ from datetime import datetime
 import wave
 import io
 import struct
+from app.audio_waveform import waveform_bars
+
+# Bound decoded image allocations for Qt-supported image readers.
+QImageReader.setAllocationLimit(64)
 
 ICONS_PATH = Path(__file__).parent.parent.parent / "assets" / "icons"
 
@@ -107,44 +111,7 @@ class VoiceWaveform(QWidget):
 
     def load_waveform_from_wav(self, wav_data: bytes):
         try:
-            wav_io = io.BytesIO(wav_data)
-            with wave.open(wav_io, 'rb') as wf:
-                n_frames = wf.getnframes()
-                sampwidth = wf.getsampwidth()
-                n_channels = wf.getnchannels()
-                raw = wf.readframes(n_frames)
-
-            if sampwidth == 2:
-                fmt = f"{len(raw) // 2}h"
-                samples = struct.unpack(fmt, raw)
-            elif sampwidth == 1:
-                fmt = f"{len(raw)}B"
-                samples = tuple(s - 128 for s in struct.unpack(fmt, raw))
-            else:
-                self._generate_placeholder_bars()
-                return
-
-            if n_channels > 1:
-                samples = samples[::n_channels]
-
-            if not samples:
-                self._generate_placeholder_bars()
-                return
-
-            chunk_size = max(1, len(samples) // self.BAR_COUNT)
-            bars = []
-            max_val = 32768 if sampwidth == 2 else 128
-
-            for i in range(self.BAR_COUNT):
-                chunk = samples[i * chunk_size: (i + 1) * chunk_size]
-                if chunk:
-                    rms = (sum(s * s for s in chunk) / len(chunk)) ** 0.5
-                    bars.append(rms / max_val)
-                else:
-                    bars.append(0.1)
-
-            max_bar = max(bars) if max(bars) > 0 else 1.0
-            self._bars = [b / max_bar for b in bars]
+            self._bars = waveform_bars(wav_data, self.BAR_COUNT)
             self.update()
 
         except Exception as e:
@@ -292,6 +259,9 @@ class MessageBubble(QFrame):
     voice_seek_requested = Signal(object, float)
     scroll_to_msg_requested = Signal(str)
     image_view_requested = Signal(QPixmap)
+    file_download_requested = Signal(str, str, str, int)
+    edit_requested = Signal(str, str)
+    pin_requested = Signal(str, str, str)
 
     def __init__(
             self,
@@ -319,6 +289,9 @@ class MessageBubble(QFrame):
         self._reply_to_msg_id = reply_to_msg_id
         self._caption = caption
         self._skeleton = None
+        self._doc_meta = None
+        self.doc_frame = None
+        self.edited_label = None
 
         self.setFocusPolicy(Qt.NoFocus)
         self.setObjectName("MessageBubbleRow")
@@ -411,10 +384,15 @@ class MessageBubble(QFrame):
         self.meta_layout.addWidget(self.time_label)
 
         if self.is_mine:
-            self.status_label = QLabel("✓✓")
+            self.status_label = QLabel("✓✓" if self.is_read else "✓")
             self.status_label.setObjectName("BubbleStatus")
             self.status_label.setFocusPolicy(Qt.NoFocus)
             self.status_label.setProperty("read", self.is_read)
+            self.status_label.setToolTip(
+                "Собеседник подтвердил прочтение"
+                if self.is_read
+                else "Сохранено; не является подтверждением прочтения"
+            )
             self.meta_layout.addWidget(self.status_label)
 
         self.bubble_layout.addWidget(self.msg_label)
@@ -458,6 +436,9 @@ class MessageBubble(QFrame):
             display_text = "Фото"
         elif display_text.startswith("[VOICE_META]"):
             display_text = "Голосовое"
+        elif display_text.startswith("[FILE_META]|"):
+            parts = display_text.split("|", 5)
+            display_text = f"📄 {parts[3]}" if len(parts) >= 4 else "Документ"
 
         self.reply_frame = QFrame()
         self.reply_frame.setObjectName("ReplyBlock")
@@ -540,10 +521,7 @@ class MessageBubble(QFrame):
     # ------------------------------------------------------------------
 
     def _on_play_clicked(self):
-        if self._voice_data:
-            self.voice_play_requested.emit(self, self._voice_data)
-        else:
-            print(f"[VOICE] Нет данных (msg_id={self.msg_id})")
+        self.voice_play_requested.emit(self, self._voice_data)
 
     def _on_seek(self, progress: float):
         self.voice_seek_requested.emit(self, progress)
@@ -612,11 +590,21 @@ class MessageBubble(QFrame):
         )
         reply_action.triggered.connect(self._on_reply_clicked)
 
-        if self._text and not self._voice_data:
+        if self._text and not self._voice_data and not self._doc_meta:
             copy_action = menu.addAction(
                 _render_svg("copy.svg", color_main, 16), "Копировать"
             )
             copy_action.triggered.connect(self._copy_text)
+            if self.is_mine:
+                edit_action = menu.addAction("Изменить")
+                edit_action.triggered.connect(self._on_edit_clicked)
+
+        if self._doc_meta:
+            dl_action = menu.addAction("Сохранить файл…")
+            dl_action.triggered.connect(self._on_doc_download_clicked)
+
+        pin_action = menu.addAction("Закрепить")
+        pin_action.triggered.connect(self._on_pin_clicked)
 
         menu.addSeparator()
 
@@ -630,8 +618,29 @@ class MessageBubble(QFrame):
     def _on_reply_clicked(self):
         if self.msg_id:
             sender = self._sender if not self.is_mine else "Вы"
-            text = self._text or ("Голосовое" if self._voice_data else "Фото")
+            if self._doc_meta:
+                text = f"📄 {self._doc_meta[2]}"
+            else:
+                text = self._text or ("Голосовое" if self._voice_data else "Фото")
             self.reply_requested.emit(self.msg_id, text, sender)
+
+    def _on_edit_clicked(self):
+        if self.msg_id and self.is_mine and self._text:
+            self.edit_requested.emit(self.msg_id, self._text)
+
+    def _on_pin_clicked(self):
+        if self.msg_id:
+            sender = self._sender if not self.is_mine else "Вы"
+            if self._doc_meta:
+                preview = f"📄 {self._doc_meta[2]}"
+            else:
+                preview = self._text or self._caption or ("Голосовое" if self._voice_data else "Фото")
+            self.pin_requested.emit(self.msg_id, preview, sender)
+
+    def _on_doc_download_clicked(self):
+        if self._doc_meta:
+            fid, skey, fname, fsize = self._doc_meta
+            self.file_download_requested.emit(fid, skey, fname, fsize)
 
     def _on_delete_clicked(self):
         if self.msg_id:
@@ -654,13 +663,12 @@ class MessageBubble(QFrame):
 
         pixmap = QPixmap()
         if pixmap.loadFromData(image_bytes):
-            self.image_label.set_pixmap_original(
-                pixmap.scaledToWidth(
-                    min(pixmap.width(), 1200), Qt.SmoothTransformation
-                )
-            )
+            original = (pixmap.scaled(1200, 1200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        if pixmap.width() > 1200 or pixmap.height() > 1200 else pixmap)
+            self.image_label.set_pixmap_original(original)
 
-            scaled = pixmap.scaledToWidth(320, Qt.SmoothTransformation)
+            scaled = (pixmap.scaled(320, 320, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                      if pixmap.width() > 320 or pixmap.height() > 320 else pixmap)
             rounded = QPixmap(scaled.size())
             rounded.fill(Qt.transparent)
 
@@ -687,11 +695,27 @@ class MessageBubble(QFrame):
                 self.caption_label.setMaximumWidth(320)
             else:
                 self.caption_label.setVisible(False)
+        else:
+            self.image_label.setVisible(False)
+            self.msg_label.setText("❌ Не удалось отобразить изображение")
+            self.msg_label.setVisible(True)
+
+    def set_pending(self, tooltip: str = None):
+        if self.is_mine and not self.is_read and hasattr(self, "status_label"):
+            self.status_label.setText("⏳")
+            self.status_label.setToolTip(
+                tooltip or "В локальной очереди: отправка ещё не подтверждена сервером"
+            )
+            self.status_label.setProperty("read", False)
+            self.status_label.style().unpolish(self.status_label)
+            self.status_label.style().polish(self.status_label)
 
     def mark_as_read(self):
         if self.is_mine and not self.is_read:
             self.is_read = True
             if hasattr(self, 'status_label'):
+                self.status_label.setText("✓✓")
+                self.status_label.setToolTip("Собеседник подтвердил прочтение")
                 self.status_label.setProperty("read", True)
                 self.status_label.style().unpolish(self.status_label)
                 self.status_label.style().polish(self.status_label)
@@ -731,3 +755,70 @@ class MessageBubble(QFrame):
 
     def set_reply_to_msg_id(self, msg_id: str):
         self._reply_to_msg_id = msg_id
+
+    def set_document(self, file_id: str, secret_key: str, filename: str, size_bytes: int, caption: str = ""):
+        from app.media_identity import (
+            format_file_size,
+            is_dangerous_executable_extension,
+            sanitize_attachment_filename,
+        )
+
+        self.hide_skeleton()
+        safe_name = sanitize_attachment_filename(filename)
+        self._doc_meta = (file_id, secret_key, safe_name, int(size_bytes))
+        self.msg_label.setVisible(False)
+
+        if self.doc_frame is None:
+            self.doc_frame = QFrame()
+            self.doc_frame.setObjectName("ReplyBlock")
+            row = QHBoxLayout(self.doc_frame)
+            row.setContentsMargins(10, 8, 10, 8)
+            row.setSpacing(10)
+
+            info_col = QVBoxLayout()
+            info_col.setSpacing(2)
+            self._doc_title_lbl = QLabel()
+            self._doc_title_lbl.setObjectName("BubbleText")
+            self._doc_title_lbl.setWordWrap(True)
+            self._doc_size_lbl = QLabel()
+            self._doc_size_lbl.setObjectName("BubbleTime")
+            info_col.addWidget(self._doc_title_lbl)
+            info_col.addWidget(self._doc_size_lbl)
+
+            self._doc_dl_btn = QPushButton("Скачать")
+            self._doc_dl_btn.setCursor(Qt.PointingHandCursor)
+            self._doc_dl_btn.setFocusPolicy(Qt.NoFocus)
+            self._doc_dl_btn.clicked.connect(self._on_doc_download_clicked)
+
+            row.addLayout(info_col, 1)
+            row.addWidget(self._doc_dl_btn, 0, Qt.AlignVCenter)
+            self.bubble_layout.insertWidget(max(0, self.bubble_layout.count() - 2), self.doc_frame)
+
+        warn = " • ⚠ Исполняемый файл" if is_dangerous_executable_extension(safe_name) else " • E2EE"
+        self._doc_title_lbl.setText(f"📄 {safe_name}")
+        self._doc_size_lbl.setText(f"{format_file_size(size_bytes)}{warn}")
+        self.bubble.setMinimumWidth(280)
+
+        if caption:
+            self._caption = caption
+            self.caption_label.setText(caption)
+            self.caption_label.setVisible(True)
+        else:
+            self.caption_label.setVisible(False)
+
+    def set_edited_text(self, new_text: str, edited: bool = True):
+        self._text = new_text
+        self.msg_label.setText(new_text)
+        self.msg_label.setVisible(bool(new_text))
+        if new_text:
+            font = self.msg_label.font()
+            font.setPixelSize(14)
+            self.msg_label.setFont(font)
+            metrics = QFontMetrics(font)
+            rect = metrics.boundingRect(QRect(0, 0, 420, 10000), Qt.TextWordWrap, new_text)
+            self.msg_label.setFixedWidth(min(rect.width() + 8, 460))
+        if edited and self.edited_label is None:
+            self.edited_label = QLabel("изм.")
+            self.edited_label.setObjectName("BubbleTime")
+            self.edited_label.setFocusPolicy(Qt.NoFocus)
+            self.meta_layout.insertWidget(0, self.edited_label)

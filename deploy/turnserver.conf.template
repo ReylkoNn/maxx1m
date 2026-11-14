@@ -1,0 +1,41 @@
+# Hardened self-hosted coturn configuration for Max1m (RU VPS without VPN)
+listening-port=3478
+tls-listening-port=${TURN_TLS_PORT}
+
+fingerprint
+use-auth-secret
+static-auth-secret=${TURN_SHARED_SECRET}
+realm=${TURN_REALM}
+
+# External IP of the Russian VPS (required if behind NAT; safe on direct public IP)
+external-ip=${VPS_PUBLIC_IP}
+
+min-port=49160
+max-port=49300
+
+# TLS 1.2+ only; disable management CLI and legacy protocols
+no-cli
+no-tlsv1
+no-tlsv1_1
+no-multicast-peers
+no-loopback-peers
+
+# Optional TLS cert for turns:443 / turns:5349 TCP/TLS media traversal
+${TURN_CERT_LINE}
+${TURN_PKEY_LINE}
+
+# Anti-SSRF: forbid relaying WebRTC packets to internal/private IP ranges
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=::1
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+
+# Privacy: suppress verbose IP session logs
+no-stdout-log
+syslog

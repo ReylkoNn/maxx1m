@@ -1,5 +1,7 @@
 import random
+import re
 import sys
+import threading
 from pathlib import Path
 from app.windows.widgets.smart_input import SmartInput
 from PySide6.QtGui import (
@@ -10,17 +12,23 @@ from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtCore import (
     QRectF, QRect, Qt, QPoint, QTimer,
     QPropertyAnimation, QEasingCurve, Property, Signal,
-    QObject, QMetaObject
+    QObject, QMetaObject, QEvent
 )
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
     QPushButton, QStackedWidget, QLineEdit, QSizeGrip,
-    QApplication, QGraphicsDropShadowEffect, QGraphicsOpacityEffect
+    QApplication, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QMessageBox
 )
 
+from app.delivery import process_delivery_page
+from app.client_api import validate_server_url
+from app.call_policy import allow_webrtc_signal, resolve_call_peer, call_context_valid
+from app import call_envelope, identity_setup
 from app.crypto_box import crypto
 from app.secure_storage import storage
-from app.workers import RegisterWorker, LoginWorker, WebSocketWorker, SyncMessagesWorker
+from app.workers import (RegisterWorker, LoginWorker, WebSocketWorker,
+                         SyncMessagesWorker, AcknowledgeMessagesWorker,
+                         LogoutSessionWorker)
 from app.config import (
     APP_NAME,
     DEFAULT_SERVER_URL,
@@ -1059,12 +1067,31 @@ class ImageViewer(QWidget):
 # ============================================================================
 
 class AppWindow(QMainWindow):
+    rtc_state_changed = Signal(str, str, str)
+    rtc_screen_state_changed = Signal(bool, str)
+    rtc_remote_screen_state_changed = Signal(str, str, bool)
+    rtc_screen_frame_ready = Signal()
+
     def __init__(self):
         super().__init__()
+        self._screen_frame_lock = threading.Lock()
+        self._screen_frame_mailbox = None
+        self._screen_frame_ui_queued = False
         self.mode = "login"
         self._is_maximized = False
         self._normal_rect = None
         self.ws_worker = None
+        self.sync_worker = None
+        self._sync_cursor = None
+        self._sync_restart_requested = False
+        self._sync_version_warning_shown = False
+        self._ack_worker = None
+        self._group_sync_worker = None
+        self.groups_fetch_worker = None
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setInterval(30000)
+        self._sync_timer.timeout.connect(self._start_message_sync)
+        self._sync_timer.timeout.connect(self._start_group_sync)
 
         self.setWindowTitle(APP_NAME)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
@@ -1110,10 +1137,149 @@ class AppWindow(QMainWindow):
         self._image_viewer.hide()
 
         # ── WebRTC Callbacks ────────────────────────────────────────────────
-        rtc.on_signal_generated  = self._send_rtc_signal
-        rtc.on_state_change      = self._on_rtc_state_change
-        rtc.on_screen_share_state = self._on_screen_share_state
-        rtc.get_peer_public_key  = self._get_peer_public_key
+        self.rtc_state_changed.connect(self._apply_rtc_state_change, Qt.QueuedConnection)
+        self.rtc_screen_state_changed.connect(self._apply_screen_share_state, Qt.QueuedConnection)
+        self.rtc_remote_screen_state_changed.connect(self._apply_remote_screen_state, Qt.QueuedConnection)
+        self.rtc_screen_frame_ready.connect(self._drain_latest_screen_frame, Qt.QueuedConnection)
+        rtc.on_signal_generated    = self._send_rtc_signal
+        rtc.on_state_change        = self._on_rtc_state_change
+        rtc.on_screen_share_state  = self._on_screen_share_state
+        rtc.on_remote_screen_state = self._on_remote_screen_state
+        rtc.on_frame_ready         = self._on_rtc_screen_frame
+        rtc.get_peer_public_key    = self._get_peer_public_key
+
+        self._init_security_watchdog()
+
+    def _init_security_watchdog(self):
+        app_inst = QApplication.instance()
+        if app_inst is not None:
+            app_inst.installEventFilter(self)
+        self._security_maintenance_timer = QTimer(self)
+        self._security_maintenance_timer.setInterval(15000)
+        self._security_maintenance_timer.timeout.connect(self._on_security_maintenance_tick)
+        self._security_maintenance_timer.start()
+
+    def _zeroize_local_vaults(self):
+        try:
+            from app.local_vault import lock_all_vaults
+            lock_all_vaults()
+        except Exception:
+            pass
+
+    def _prompt_emergency_panic_wipe(self):
+        if getattr(self, "_panic_wipe_dialog_open", False):
+            return
+        self._panic_wipe_dialog_open = True
+        try:
+            answer = QMessageBox.warning(
+                self,
+                "Экстренное уничтожение данных (Panic Wipe)",
+                "Двухпроходно перезаписать и безвозвратно удалить ключи, историю и кэш профиля?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer == QMessageBox.Yes:
+                from app.local_vault import execute_panic_wipe
+                uname = getattr(state, "username", "") or None
+                self.logout_session()
+                execute_panic_wipe(uname, wipe_all_profiles=(uname is None))
+                self._set_status("Сессия завершена.", False)
+        finally:
+            self._panic_wipe_dialog_open = False
+
+    def eventFilter(self, obj, event):
+        etype = event.type()
+        if etype in (QEvent.KeyPress, QEvent.MouseButtonPress, QEvent.MouseMove, QEvent.Wheel):
+            try:
+                from app.local_vault import record_user_activity
+                record_user_activity()
+            except Exception:
+                pass
+        if etype == QEvent.KeyPress:
+            mods = event.modifiers()
+            ctrl_shift = Qt.ControlModifier | Qt.ShiftModifier
+            if (mods & ctrl_shift) == ctrl_shift:
+                if event.key() == Qt.Key_L:
+                    if self.logout_session():
+                        self._zeroize_local_vaults()
+                        self._set_status("Сессия экстренно заблокирована (RAM очищена).", False)
+                    return True
+                if event.key() == Qt.Key_Backspace:
+                    QTimer.singleShot(0, self._prompt_emergency_panic_wipe)
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _on_security_maintenance_tick(self):
+        uname = getattr(state, "username", "") or ""
+        tok = getattr(state, "token", "") or ""
+        if not uname or not tok:
+            return
+        try:
+            purge_fn = getattr(storage, "purge_expired_messages", None)
+            if callable(purge_fn):
+                purged = purge_fn(uname)
+                if purged and hasattr(self, "main_screen") and hasattr(self.main_screen, "refresh_visible_chat_if_needed"):
+                    self.main_screen.refresh_visible_chat_if_needed()
+        except Exception:
+            pass
+
+        try:
+            from app.local_vault import idle_seconds
+            auto_fn = getattr(storage, "get_auto_lock_seconds", None)
+            auto_sec = auto_fn(uname) if callable(auto_fn) else 0
+            if auto_sec > 0 and idle_seconds() >= float(auto_sec):
+                if self.logout_session():
+                    self._zeroize_local_vaults()
+                    self._set_status("Сессия автоматически заблокирована по таймеру неактивности.", False)
+        except Exception:
+            pass
+
+    def _ensure_vault_unlocked_ui(self, username: str) -> bool:
+        try:
+            from app.local_vault import (
+                VaultAuthenticationError,
+                is_vault_enabled,
+                is_vault_unlocked,
+                unlock_vault,
+            )
+        except Exception:
+            return True
+        if not username or not is_vault_enabled(username) or is_vault_unlocked(username):
+            return True
+
+        from PySide6.QtWidgets import QInputDialog
+        while True:
+            pw, ok = QInputDialog.getText(
+                self,
+                "Локальный сейф защищён (Argon2id)",
+                f"Введите мастер-пароль сейфа для профиля @{username}:",
+                QLineEdit.Password,
+            )
+            if not ok or not pw:
+                self._set_status("Разблокировка локального сейфа отменена.", True)
+                return False
+            try:
+                outcome = unlock_vault(username, pw)
+                if outcome == "duress_wiped":
+                    state.device_id = ""
+                    state.username = ""
+                    self._set_status("Неверный мастер-пароль или локальный профиль повреждён.", True)
+                    return False
+                return True
+            except VaultAuthenticationError:
+                retry = QMessageBox.warning(
+                    self,
+                    "Неверный пароль сейфа",
+                    "Мастер-пароль не подошёл. Попробовать ещё раз?",
+                    QMessageBox.Retry | QMessageBox.Cancel,
+                    QMessageBox.Retry,
+                )
+                if retry != QMessageBox.Retry:
+                    self._set_status("Разблокировка локального сейфа отменена.", True)
+                    return False
+            except Exception as exc:
+                self._set_status(f"Ошибка открытия локального сейфа: {type(exc).__name__}", True)
+                return False
 
 
     def _forward_video_track(self, peer_device_id: str, receiver):
@@ -1147,48 +1313,12 @@ class AppWindow(QMainWindow):
         self.tray.show()
 
     def _on_incoming_screen_frame(self, data: dict):
-        """
-        Входящий кадр демки из WebSocket.
-        data = {"type": "screen_frame", "from_device_id": ..., "frame": base64_str}
-
-        Передаём в ScreenShareManager для декодирования,
-        он вызовет on_frame_received который мы подключили в _on_incoming_screen_control.
-        """
-        rtc.screen.handle_incoming_frame(data)
+        """Legacy unencrypted WebSocket screen_frame packets are ignored (E2EE WebRTC only)."""
+        return
 
     def _on_incoming_screen_control(self, data: dict):
-        """
-        Управляющее сообщение демки (start/stop).
-        data = {"type": "screen_control", "action": "start"/"stop", "from_device_id": ...}
-        """
-        action = data.get("action")
-        from_id = data.get("from_device_id", "")
-        print(f"[AppWindow] 🖥️ screen_control: action={action} from={from_id[:8] if from_id else '?'}")
-
-        if action == "start":
-            # Подключаем callback — каждый декодированный кадр идёт в main_screen
-            def on_frame_decoded(numpy_frame):
-                if hasattr(self, "main_screen") and self.main_screen:
-                    handler = getattr(self.main_screen, "_on_screen_frame_numpy", None)
-                    if callable(handler):
-                        handler(numpy_frame)
-
-            rtc.screen.start_receiving(on_frame_decoded)
-
-            # Уведомляем main_screen что демка началась
-            if hasattr(self, "main_screen") and self.main_screen:
-                handler = getattr(self.main_screen, "_on_screen_share_started", None)
-                if callable(handler):
-                    handler(from_id)
-
-        elif action == "stop":
-            rtc.screen.stop_receiving()
-
-            # Уведомляем main_screen что демка остановлена
-            if hasattr(self, "main_screen") and self.main_screen:
-                handler = getattr(self.main_screen, "_on_screen_share_stopped", None)
-                if callable(handler):
-                    handler(from_id)
+        """Legacy unencrypted WebSocket screen_control packets are ignored (E2EE WebRTC only)."""
+        return
 
     def _on_screen_frame(self, data: bytes, w: int, h: int, is_jpeg: bool):
         """Оставляем для совместимости — больше не используется."""
@@ -1217,7 +1347,15 @@ class AppWindow(QMainWindow):
         self._image_viewer.show_image(pixmap)
 
     def _load_local_state_on_startup(self):
-        local_data = storage.load_local_state()
+        try:
+            local_data = storage.load_local_state()
+        except Exception:
+            if hasattr(self, "_set_status"):
+                self._set_status(
+                    "Локальное состояние повреждено или недоступно; файл сохранён для восстановления.",
+                    True,
+                )
+            return
         if local_data:
             state.server_url = local_data.get("server_url", DEFAULT_SERVER_URL)
             state.username = local_data.get("username", "")
@@ -1233,6 +1371,9 @@ class AppWindow(QMainWindow):
         self.auth_screen = self._build_auth_screen()
         self.loading_screen = self._build_loading_screen()
         self.main_screen = self._build_main_screen()
+        self.main_screen.contact_verification_changed.connect(self._on_contact_verification_changed, Qt.QueuedConnection)
+        if hasattr(self.main_screen, "logout_requested"):
+            self.main_screen.logout_requested.connect(self.logout_session, Qt.QueuedConnection)
         self.stack.addWidget(self.auth_screen)
         self.stack.addWidget(self.loading_screen)
         self.stack.addWidget(self.main_screen)
@@ -1321,6 +1462,32 @@ class AppWindow(QMainWindow):
         self.server_block = self._make_input_block("Сервер", DEFAULT_SERVER_URL)
         self.server_block["input"].setText(DEFAULT_SERVER_URL)
         advanced_layout.addWidget(self.server_block["container"])
+        self.spki_pin_block = self._make_input_block(
+            "TLS SPKI Pin сервера (защита от MITM)",
+            "sha256/... (опционально или из max1m-join://)",
+        )
+        advanced_layout.addWidget(self.spki_pin_block["container"])
+
+        self.join_link_block = QFrame()
+        self.join_link_block.setObjectName("InputBlock")
+        join_v = QVBoxLayout(self.join_link_block)
+        join_v.setContentsMargins(0, 0, 0, 0)
+        join_v.setSpacing(6)
+        join_lbl = QLabel("Быстрое подключение команды (max1m-join://)")
+        join_lbl.setObjectName("FieldLabel")
+        join_h = QHBoxLayout()
+        join_h.setSpacing(6)
+        self.join_link_input = QLineEdit()
+        self.join_link_input.setPlaceholderText("Вставьте строку max1m-join:// от администратора")
+        self.join_link_input.returnPressed.connect(self.apply_join_link_from_ui)
+        self.join_link_btn = QPushButton("Применить")
+        self.join_link_btn.setObjectName("SecondaryButton")
+        self.join_link_btn.setCursor(Qt.PointingHandCursor)
+        self.join_link_btn.clicked.connect(self.apply_join_link_from_ui)
+        join_h.addWidget(self.join_link_input, 1)
+        join_h.addWidget(self.join_link_btn, 0)
+        join_v.addWidget(join_lbl)
+        join_v.addLayout(join_h)
 
         self.status_label = QLabel("")
         self.status_label.setObjectName("StatusLabel")
@@ -1335,6 +1502,7 @@ class AppWindow(QMainWindow):
         card_layout.addSpacing(8)
         card_layout.addLayout(mode_row)
         card_layout.addWidget(self.hint_label)
+        card_layout.addWidget(self.join_link_block)
         card_layout.addWidget(self.username_block["container"])
         card_layout.addWidget(self.password_block["container"])
         card_layout.addWidget(self.invite_block["container"])
@@ -1432,6 +1600,33 @@ class AppWindow(QMainWindow):
         self.status_label.style().unpolish(self.status_label)
         self.status_label.style().polish(self.status_label)
 
+    def apply_join_link_from_ui(self) -> bool:
+        raw_link = self.join_link_input.text().strip() if hasattr(self, "join_link_input") else ""
+        if not raw_link:
+            return False
+        try:
+            from app.onboarding import parse_join_link, save_prelogin_spki_pins
+
+            cfg = parse_join_link(raw_link)
+            save_prelogin_spki_pins(cfg.server_url, cfg.spki_pins, storage_obj=storage)
+            self.server_block["input"].setText(cfg.server_url)
+            if hasattr(self, "spki_pin_block"):
+                self.spki_pin_block["input"].setText(", ".join(cfg.spki_pins))
+            if cfg.invite_code:
+                self.invite_block["input"].setText(cfg.invite_code)
+                self._set_mode("register")
+            self.join_link_input.clear()
+            title_note = f" «{cfg.node_title}»" if cfg.node_title else ""
+            self._set_status(
+                f"Узел{title_note} подключён: TLS SPKI ключ закреплён ({len(cfg.spki_pins)} шт.). "
+                + ("Инвайт-код подставлен — введите логин и пароль." if cfg.invite_code else "Введите логин и пароль."),
+                False,
+            )
+            return True
+        except Exception as exc:
+            self._set_status(str(exc), True)
+            return False
+
     def _submit(self):
         server = self.server_block["input"].text().strip()
         username = self.username_block["input"].text().strip()
@@ -1441,10 +1636,26 @@ class AppWindow(QMainWindow):
 
         if not server:
             return self._set_status("Укажи адрес сервера", True)
-        if len(username) < 3:
-            return self._set_status(
-                "Имя пользователя должно быть не короче 3 символов", True
-            )
+        validate_url_fn = globals().get("validate_server_url")
+        if callable(validate_url_fn):
+            url_ok, url_err = validate_url_fn(server)
+            if not url_ok:
+                return self._set_status(url_err, True)
+        spki_blk = getattr(self, "spki_pin_block", None)
+        raw_spki_text = spki_blk["input"].text().strip() if isinstance(spki_blk, dict) and "input" in spki_blk else ""
+        if raw_spki_text:
+            try:
+                from app.onboarding import save_prelogin_spki_pins
+
+                pins_list = [p.strip() for p in re.split(r"[,;|]", raw_spki_text) if p.strip()]
+                save_prelogin_spki_pins(server, pins_list, storage_obj=storage)
+            except Exception as exc:
+                return self._set_status(f"Некорректный TLS SPKI Pin: {exc}", True)
+        if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", username):
+            return self._set_status("Имя: 3–30 латинских букв, цифр или знаков подчёркивания", True)
+        if (state.device_id and state.username == username and
+                (state.server_url or '').rstrip('/') != server.rstrip('/')):
+            return self._set_status("Этот локальный профиль уже привязан к другому серверу. Автоматическая замена ключа отключена.", True)
         if len(password) < 8:
             return self._set_status(
                 "Пароль должен быть не короче 8 символов", True
@@ -1456,7 +1667,6 @@ class AppWindow(QMainWindow):
         if self.mode == "register" and not invite_code:
             return self._set_status("Для регистрации нужен инвайт-код", True)
 
-        state.server_url = server
         self.submit_button.setEnabled(False)
 
         if self.mode == "register":
@@ -1465,8 +1675,11 @@ class AppWindow(QMainWindow):
             self._start_login(server, username, password, device_name)
 
     def _start_registration(self, server, username, password, device_name, invite_code):
-        crypto.generate_new_keypair()
-        storage.save_private_key(username, crypto.get_private_key_b64())
+        try:
+            identity_setup.prepare_new_identity(username, server, "register", crypto)
+        except Exception:
+            self.submit_button.setEnabled(True)
+            return self._set_status("Локальный ключ или профиль уже существует либо недоступен. Он не перезаписан; требуется восстановление.", True)
 
         payload = {
             "username": username, "password": password,
@@ -1476,6 +1689,8 @@ class AppWindow(QMainWindow):
         }
 
         self.worker = RegisterWorker(server_url=server, payload=payload)
+        self.worker.auth_context = (server.rstrip('/'), username, device_name, "register", crypto.get_public_key_b64())
+        self.worker._register_password = password
         self.worker.finished.connect(self._on_register_finished)
         self.stack.setCurrentWidget(self.loading_screen)
         self._update_auth_animation_state()
@@ -1487,24 +1702,54 @@ class AppWindow(QMainWindow):
         self.worker.start()
 
     def _on_register_finished(self, success: bool, response_data: dict | str):
+        password = getattr(self.worker, "_register_password", None)
+        if hasattr(self.worker, "_register_password"):
+            self.worker._register_password = None
         self.submit_button.setEnabled(True)
         if success:
-            state.device_id = response_data.get("device_id")
-            state.username = self.username_block["input"].text().strip()
-            state.device_name = self.device_block["input"].text().strip()
-            storage.save_local_state({
-                "server_url": state.server_url,
-                "username": state.username,
-                "device_name": state.device_name,
-                "device_id": state.device_id
-            })
-            self.loading_screen.set_status(
-                "Успех!", "Устройство успешно зарегистрировано.", "Готово"
-            )
-            QTimer.singleShot(
-                1500, lambda: self.stack.setCurrentWidget(self.main_screen)
-            )
+            server, username, device_name, purpose, expected_public = self.worker.auth_context
+            device_id = response_data.get("device_id") if isinstance(response_data, dict) else None
+            if (not isinstance(device_id, str) or not device_id
+                    or not identity_setup.current_identity_matches(username, crypto, expected_public)):
+                self.stack.setCurrentWidget(self.auth_screen)
+                self._update_auth_animation_state()
+                return self._set_status("Сервер не подтвердил устройство; ключ сохранён для восстановления.", True)
+            try:
+                storage.save_local_state({"server_url": server, "username": username,
+                                          "device_name": device_name, "device_id": device_id})
+            except Exception:
+                self.stack.setCurrentWidget(self.auth_screen)
+                self._update_auth_animation_state()
+                return self._set_status("Не удалось сохранить устройство. Ключ сохранён; может потребоваться восстановление.", True)
+            state.server_url, state.username, state.device_name, state.device_id = server, username, device_name, device_id
+            try:
+                identity_setup.finish_identity(username, server, purpose, crypto)
+            except Exception:
+                # Preserve any unreadable/mismatched marker for recovery.
+                print("[AUTH] Не удалось завершить сохранение маркера ключа")
+            save_profile = getattr(storage, "save_profile_device", None)
+            if callable(save_profile):
+                try:
+                    save_profile(username, server, device_id, device_name, expected_public)
+                except Exception:
+                    print("[AUTH] Не удалось сохранить привязку устройства профиля")
+            if hasattr(storage, "save_tls_pins") and hasattr(storage, "load_tls_pins"):
+                try:
+                    from app.onboarding import promote_prelogin_spki_pins
+                    promote_prelogin_spki_pins(username, server, storage_obj=storage)
+                except Exception:
+                    pass
+            if callable(getattr(self, "_set_mode", None)):
+                self._set_mode("login")
+            if isinstance(password, str) and password and callable(getattr(self, "_start_login", None)):
+                self.submit_button.setEnabled(False)
+                self._start_login(server, username, password, device_name)
+                return
+            if hasattr(self, "auth_screen") and hasattr(self.stack, "setCurrentWidget"):
+                self.stack.setCurrentWidget(self.auth_screen)
             self._update_auth_animation_state()
+            if callable(getattr(self, "_set_status", None)):
+                self._set_status("Устройство зарегистрировано. Выполните вход.", False)
         else:
             self.stack.setCurrentWidget(self.auth_screen)
             self._update_auth_animation_state()
@@ -1512,21 +1757,66 @@ class AppWindow(QMainWindow):
 
     def _start_login(self, server, username, password, device_name):
         payload = {"username": username, "password": password}
+        clean_server = server.rstrip("/")
 
-        if state.device_id and state.username == username:
-            payload["device_id"] = state.device_id
-            priv_key = storage.get_private_key(username)
-            if not priv_key:
+        ensure_vault_fn = getattr(self, "_ensure_vault_unlocked_ui", None)
+        if callable(ensure_vault_fn):
+            if not ensure_vault_fn(username):
+                self.submit_button.setEnabled(True)
+                return
+
+        profile_record = None
+        storage_obj = globals().get("storage")
+        load_profile = getattr(storage_obj, "load_profile_device", None)
+        if callable(load_profile):
+            try:
+                profile_record = load_profile(username)
+            except Exception:
                 self.submit_button.setEnabled(True)
                 return self._set_status(
-                    "Ключи устройства утеряны. Необходима перерегистрация.", True
+                    "Локальный профиль устройства повреждён или недоступен. Требуется восстановление.",
+                    True,
                 )
-            crypto.load_private_key(priv_key)
+
+        existing_device_id = None
+        bound_server = None
+        expected_saved_pub = None
+        if profile_record is not None:
+            existing_device_id = profile_record.get("device_id")
+            bound_server = profile_record.get("server_url")
+            expected_saved_pub = profile_record.get("public_key")
+            if not device_name:
+                device_name = profile_record.get("device_name") or device_name
+        elif getattr(state, "device_id", None) and getattr(state, "username", None) == username:
+            existing_device_id = state.device_id
+            bound_server = getattr(state, "server_url", None)
+
+        if existing_device_id:
+            if isinstance(bound_server, str) and bound_server.strip() and bound_server.rstrip("/") != clean_server:
+                self.submit_button.setEnabled(True)
+                return self._set_status(
+                    f"Локальный профиль @{username} привязан к другому серверу ({bound_server.rstrip('/')}).",
+                    True,
+                )
+            payload["device_id"] = existing_device_id
+            try:
+                priv_key = storage.get_private_key(username)
+                if not priv_key:
+                    raise ValueError("Missing private key")
+                crypto.load_private_key(priv_key)
+                if expected_saved_pub and crypto.get_public_key_b64() != expected_saved_pub:
+                    raise ValueError("Private key does not match profile device")
+            except Exception:
+                self.submit_button.setEnabled(True)
+                return self._set_status("Ключ устройства недоступен. Восстановите исходный keyring и профиль.", True)
             status_title = "Проверка устройства"
             status_msg = "Авторизация существующего устройства в сети Max1m."
         else:
-            crypto.generate_new_keypair()
-            storage.save_private_key(username, crypto.get_private_key_b64())
+            try:
+                identity_setup.prepare_new_identity(username, server, "device", crypto)
+            except Exception:
+                self.submit_button.setEnabled(True)
+                return self._set_status("Локальный ключ или профиль уже существует либо недоступен. Он не перезаписан; требуется восстановление.", True)
             payload["device_name"] = device_name
             payload["public_key"] = crypto.get_public_key_b64()
             payload["fingerprint"] = crypto.get_fingerprint()
@@ -1537,6 +1827,9 @@ class AppWindow(QMainWindow):
             )
 
         self.worker = LoginWorker(server_url=server, payload=payload)
+        self.worker.auth_context = (server.rstrip('/'), username, device_name,
+                                    None if "device_id" in payload else "device", payload.get("device_id"),
+                                    crypto.get_public_key_b64())
         self.worker.finished.connect(self._on_login_finished)
         self.stack.setCurrentWidget(self.loading_screen)
         self._update_auth_animation_state()
@@ -1546,86 +1839,117 @@ class AppWindow(QMainWindow):
     def _on_login_finished(self, success: bool, response_data: dict | str):
         self.submit_button.setEnabled(True)
         if success:
-            state.token = response_data.get("access_token")
-            new_device_id = response_data.get("device_id")
-            username = self.username_block["input"].text().strip()
-            device_name = self.device_block["input"].text().strip()
-            state.username = username
-            state.device_id = new_device_id
+            server, username, device_name, purpose, expected_device_id, expected_public = self.worker.auth_context
+            token = response_data.get("access_token") if isinstance(response_data, dict) else None
+            new_device_id = response_data.get("device_id") if isinstance(response_data, dict) else None
+            if not isinstance(token, str) or not token or not isinstance(new_device_id, str) or not new_device_id:
+                self.stack.setCurrentWidget(self.auth_screen)
+                self._update_auth_animation_state()
+                return self._set_status("Сервер не подтвердил авторизацию; ключ сохранён.", True)
+            try:
+                valid_device = (response_data.get("device_public_key") == expected_public
+                                and identity_setup.current_identity_matches(username, crypto, expected_public)
+                                and (expected_device_id is None or new_device_id == expected_device_id))
+            except Exception:
+                valid_device = False
+            if not valid_device:
+                self.stack.setCurrentWidget(self.auth_screen)
+                self._update_auth_animation_state()
+                return self._set_status("Ключ или ID устройства не совпадает с ответом сервера. Проверьте keyring или обновите сервер.", True)
+            device_name = device_name or state.device_name
+            try:
+                storage.save_local_state({"server_url": server, "username": username,
+                                          "device_name": device_name, "device_id": new_device_id})
+            except Exception:
+                self.stack.setCurrentWidget(self.auth_screen)
+                self._update_auth_animation_state()
+                return self._set_status("Не удалось сохранить устройство. Ключ сохранён; может потребоваться восстановление.", True)
+            state.server_url, state.token, state.username, state.device_id = server, token, username, new_device_id
+            state.device_name = device_name
+            if purpose:
+                try:
+                    identity_setup.finish_identity(username, server, purpose, crypto)
+                except Exception:
+                    print("[AUTH] Не удалось завершить сохранение маркера ключа")
+            save_profile = getattr(storage, "save_profile_device", None)
+            if callable(save_profile):
+                try:
+                    save_profile(username, server, new_device_id, device_name, expected_public)
+                except Exception:
+                    print("[AUTH] Не удалось сохранить привязку устройства профиля")
+            if hasattr(storage, "save_tls_pins") and hasattr(storage, "load_tls_pins"):
+                try:
+                    from app.onboarding import promote_prelogin_spki_pins
+                    promote_prelogin_spki_pins(username, server, storage_obj=storage)
+                except Exception:
+                    pass
+            self.main_screen._load_allies_from_storage()
+            if hasattr(self.main_screen, "_load_groups_from_storage"):
+                self.main_screen._load_groups_from_storage()
 
-            storage.save_local_state({
-                "server_url": state.server_url,
-                "username": username,
-                "device_name": device_name if device_name else state.device_name,
-                "device_id": new_device_id
-            })
+            old_ws = getattr(self, "ws_worker", None)
+            if old_ws is not None:
+                old_ws.stop()
+                old_ws.wait(1000)
 
             print("[UI] Запускаем WebSocketWorker...")
             self.ws_worker = WebSocketWorker(
                 state.server_url, state.token, state.device_id
             )
 
-            # ── Личные сообщения ────────────────────────────────────
-            self.ws_worker.new_message_received.connect(
-                self._on_incoming_message, Qt.QueuedConnection
-            )
-            self.ws_worker.connection_status.connect(
-                self.main_screen.update_connection_status, Qt.QueuedConnection
-            )
-
-            # ── Групповые события ────────────────────────────────────
-            self.ws_worker.group_message_received.connect(
-                self._on_incoming_group_message, Qt.QueuedConnection
-            )
-            self.ws_worker.group_created_received.connect(
-                self._on_group_created_event, Qt.QueuedConnection
-            )
-            self.ws_worker.group_invited_received.connect(
-                self._on_group_invited_event, Qt.QueuedConnection
-            )
-            self.ws_worker.group_member_joined.connect(
-                self._on_group_member_joined, Qt.QueuedConnection
-            )
-            self.ws_worker.group_member_left.connect(
-                self._on_group_member_left, Qt.QueuedConnection
-            )
-            self.ws_worker.group_deleted_received.connect(
-                self._on_group_deleted_event, Qt.QueuedConnection
-            )
-
-            # ── WebRTC сигналинг ─────────────────────────────────────
-            self.ws_worker.webrtc_signal_received.connect(
-                self._on_webrtc_signal, Qt.QueuedConnection
-            )
-            self.ws_worker.call_offer_received.connect(
-                self._on_call_offer, Qt.QueuedConnection
-            )
-            self.ws_worker.call_accept_received.connect(
-                self._on_call_accepted, Qt.QueuedConnection
-            )
-            self.ws_worker.call_ended_received.connect(
-                self._on_call_ended, Qt.QueuedConnection
-            )
-
-            # ── Демонстрация экрана ──────────────────────────────────────
-            self.ws_worker.screen_frame_received.connect(
-                self._on_incoming_screen_frame, Qt.QueuedConnection
-            )
-            self.ws_worker.screen_control_received.connect(
-                self._on_incoming_screen_control, Qt.QueuedConnection
-            )
+            worker = self.ws_worker
+            worker.account_context = (state.username, state.server_url, state.device_id, state.token)
+            for signal, handler in (
+                (worker.new_message_received, self._on_incoming_message),
+                (worker.group_message_received, self._on_incoming_group_message),
+                (worker.group_created_received, self._on_group_created_event),
+                (worker.group_invited_received, self._on_group_invited_event),
+                (worker.group_member_joined, self._on_group_member_joined),
+                (worker.group_member_left, self._on_group_member_left),
+                (worker.group_deleted_received, self._on_group_deleted_event),
+                (worker.webrtc_signal_received, self._on_webrtc_signal),
+                (worker.call_offer_received, self._on_call_offer),
+                (worker.call_accept_received, self._on_call_accepted),
+                (worker.call_ended_received, self._on_call_ended),
+            ):
+                self._connect_ws_event(worker, signal, handler)
+            sk_upd_sig = getattr(worker, "group_sender_key_updated", None)
+            if sk_upd_sig is not None:
+                self._connect_ws_event(
+                    worker,
+                    sk_upd_sig,
+                    getattr(self, "_on_group_sender_key_updated", lambda *a: None),
+                )
+            gv_state_sig = getattr(worker, "group_voice_state_received", None)
+            if gv_state_sig is not None and hasattr(self.main_screen, "on_group_voice_state_event"):
+                self._connect_ws_event(worker, gv_state_sig, self.main_screen.on_group_voice_state_event)
+            gv_sig_sig = getattr(worker, "group_voice_signal_received", None)
+            if gv_sig_sig is not None and hasattr(self.main_screen, "on_group_voice_signal_event"):
+                self._connect_ws_event(worker, gv_sig_sig, self.main_screen.on_group_voice_signal_event)
+            worker.connection_status.connect(
+                lambda status, w=worker: self._on_ws_connection_status(status, w), Qt.QueuedConnection)
 
             self.ws_worker.start()
 
-            print("[UI] Запрашиваем пропущенные сообщения (Sync)...")
-            self.sync_worker = SyncMessagesWorker(state.server_url, state.token)
-            self.sync_worker.finished.connect(self._on_sync_finished)
-            self.sync_worker.start()
+            self._sync_cursor = None
+            self._sync_version_warning_shown = False
+            self._sync_timer.start()
+            self._start_message_sync()
+            if hasattr(self.main_screen, "_try_outbox"):
+                QTimer.singleShot(0, self.main_screen._try_outbox)
+            if hasattr(self.main_screen, "_try_attachment_outbox"):
+                QTimer.singleShot(0, self.main_screen._try_attachment_outbox)
+            if hasattr(self.main_screen, "sync_own_prekey_bundle"):
+                QTimer.singleShot(0, self.main_screen.sync_own_prekey_bundle)
+            if hasattr(self.main_screen, "sync_ice_config"):
+                QTimer.singleShot(0, self.main_screen.sync_ice_config)
 
-            from app.workers import SyncGroupMessagesWorker, FetchGroupsWorker
+            from app.workers import FetchGroupsWorker
             self.groups_fetch_worker = FetchGroupsWorker(state.server_url, state.token)
-            self.groups_fetch_worker.finished.connect(self._on_groups_fetched)
-            self.groups_fetch_worker.start()
+            group_worker = self.groups_fetch_worker
+            group_worker.account_context = (state.username, state.server_url, state.device_id, state.token)
+            group_worker.finished.connect(lambda ok, data, w=group_worker: self._on_groups_fetched(ok, data, w), Qt.QueuedConnection)
+            group_worker.start()
 
             self.loading_screen.set_status(
                 "Успех!", "Защищённое соединение с узлом установлено.", "Готово"
@@ -1639,27 +1963,163 @@ class AppWindow(QMainWindow):
             self._update_auth_animation_state()
             self._set_status(response_data, True)
 
+    def _connect_ws_event(self, worker, signal, handler):
+        def deliver(data):
+            try:
+                if (worker is self.ws_worker and worker.account_context ==
+                        (state.username, state.server_url, state.device_id, state.token)):
+                    handler(data)
+            finally:
+                worker.release_event()
+        signal.connect(deliver, Qt.QueuedConnection)
+
+    def _on_ws_connection_status(self, status, worker):
+        if (worker is not self.ws_worker or worker.account_context !=
+                (state.username, state.server_url, state.device_id, state.token)):
+            return
+        if status == "auth_check":
+            self._on_sync_connection_status(status)
+            return
+        self.main_screen.update_connection_status(status)
+        self._on_sync_connection_status(status)
+
     def _on_group_deleted_event(self, data: dict):
         group_id = data.get("group_id")
         if hasattr(self, "main_screen"):
             self.main_screen.force_remove_group(group_id)
 
-    def _on_sync_finished(self, success: bool, messages: list | str):
-        if success:
-            if isinstance(messages, list) and messages:
-                print(f"[SYNC] Получено {len(messages)} пропущенных сообщений!")
-                if hasattr(self, "main_screen") and self.main_screen is not None:
-                    self.main_screen.process_sync_messages(messages)
+    def _on_sync_connection_status(self, status: str):
+        if status == "connected":
+            self._start_message_sync()
+        elif status == "auth_check":
+            if getattr(self, "sync_worker", None) is not None or getattr(self, "_ack_worker", None) is not None:
+                self._sync_restart_requested = True
             else:
-                print("[SYNC] Пропущенных сообщений нет.")
+                self._start_message_sync()
+
+    def _on_contact_verification_changed(self):
+        # Rescan from the beginning; earlier rejected messages were not acked.
+        self._sync_cursor = None
+        self._sync_restart_requested = True
+        QTimer.singleShot(250, self._start_message_sync)
+
+    def _start_message_sync(self):
+        if not state.token or not state.server_url:
+            return
+        if self.sync_worker is not None or self._ack_worker is not None:
+            return
+        self._sync_restart_requested = False
+        self.sync_worker = SyncMessagesWorker(state.server_url, state.token, self._sync_cursor)
+        worker = self.sync_worker
+        worker.account_context = (state.username, state.server_url, state.device_id, state.token)
+        worker.finished.connect(lambda ok, data, w=worker: self._on_sync_finished(ok, data, w), Qt.QueuedConnection)
+        worker.start()
+
+    def _on_sync_finished(self, success: bool, messages: list | str, worker):
+        worker.wait()
+        if worker is not self.sync_worker:
+            return
+        self.sync_worker = None
+        if worker.account_context != (state.username, state.server_url, state.device_id, state.token):
+            self._sync_cursor = None
+            return
+        if not success or not isinstance(messages, list):
+            if isinstance(messages, str) and messages.startswith(("HTTP 401:", "HTTP 403:")):
+                invalidate_fn = getattr(self, "_handle_remote_session_invalidated", None)
+                if callable(invalidate_fn):
+                    invalidate_fn("Сессия истекла или устройство отозвано. Выполните вход снова.")
+                return
+            print(f"[SYNC] Ошибка безопасной синхронизации: {messages}")
+            self._sync_cursor = None
+            if self._sync_restart_requested:
+                self._sync_restart_requested = False
+                QTimer.singleShot(250, self._start_message_sync)
+            if isinstance(messages, str) and messages.startswith("HTTP 404:") and not self._sync_version_warning_shown:
+                self._sync_version_warning_shown = True
+                QMessageBox.warning(
+                    self, "Требуется обновление сервера",
+                    "Сервер не поддерживает безопасную синхронизацию. "
+                    "Обновите сервер Max1m: сообщения, отправленные вам вне сети, "
+                    "не будут загружены до обновления."
+                )
+            return
+        if not hasattr(self, "main_screen") or self.main_screen is None:
+            self._sync_cursor = None
+            return
+
+        account_context = worker.account_context
+        screen = self.main_screen
+        def process_for_account(message):
+            current = (state.username, state.server_url, state.device_id, state.token)
+            if current != account_context or getattr(self, "main_screen", None) is not screen:
+                return False
+            accepted = screen.process_incoming_message(message, is_sync=True)
+            return (accepted and getattr(self, "main_screen", None) is screen and account_context ==
+                    (state.username, state.server_url, state.device_id, state.token))
+
+        processed, next_cursor = process_delivery_page(messages, process_for_account)
+        if (getattr(self, "main_screen", None) is not screen or account_context !=
+                (state.username, state.server_url, state.device_id, state.token)):
+            # Never acknowledge or advance a page under a different session.
+            self._sync_cursor = None
+            return
+
+        if processed:
+            # Only one acknowledgement request may run at a time. Continue the
+            # scan only after it finishes; otherwise slow servers can create an
+            # unbounded number of QThreads while the cursor races ahead.
+            worker = AcknowledgeMessagesWorker(account_context[1], account_context[3], processed)
+            worker.account_context = account_context
+            worker.next_cursor = next_cursor
+            self._ack_worker = worker
+            worker.finished.connect(lambda ok, result, w=worker: self._on_delivery_ack_finished(ok, result, w),
+                                    Qt.QueuedConnection)
+            worker.start()
+            return
+        self._continue_message_sync(next_cursor)
+
+    def _continue_message_sync(self, next_cursor):
+        if self._sync_restart_requested:
+            self._sync_cursor = None
+            self._sync_restart_requested = False
+            QTimer.singleShot(250, self._start_message_sync)
+        elif next_cursor:
+            self._sync_cursor = next_cursor
+            QTimer.singleShot(250, self._start_message_sync)
         else:
-            print(f"[SYNC] Ошибка синхронизации: {messages}")
+            self._sync_cursor = None
+
+    def _on_delivery_ack_finished(self, success: bool, result, worker):
+        worker.wait()
+        if worker is not self._ack_worker:
+            return
+        self._ack_worker = None
+        if worker.account_context != (state.username, state.server_url, state.device_id, state.token):
+            self._sync_cursor = None
+            return
+        if not success:
+            if result in (401, 403):
+                invalidate_fn = getattr(self, "_handle_remote_session_invalidated", None)
+                if callable(invalidate_fn):
+                    invalidate_fn("Сессия истекла или устройство отозвано. Выполните вход снова.")
+                return
+            print(f"[SYNC] Не удалось подтвердить доставку: {result}; повторим при следующей синхронизации")
+        self._continue_message_sync(worker.next_cursor)
 
     def _on_incoming_message(self, data: dict):
-        print("\n[WS] 🔥 ВХОДЯЩИЙ ПАКЕТ:")
-        print(data)
         if hasattr(self, "main_screen") and self.main_screen is not None:
             self.main_screen.process_incoming_message(data)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            QTimer.singleShot(0, self._on_window_activated)
+
+    def _on_window_activated(self):
+        screen = getattr(self, "main_screen", None)
+        stack = getattr(self, "stack", None)
+        if self.isActiveWindow() and screen and stack and stack.currentWidget() is screen:
+            screen._mark_visible_history_read()
 
     def toggle_maximize(self):
         if not self._is_maximized:
@@ -1689,9 +2149,13 @@ class AppWindow(QMainWindow):
             is_auth_visible = self.stack.currentWidget() is self.auth_screen
             self.auth_screen.set_animation_active(is_auth_visible)
 
-    def show_notification(self, title: str, message: str):
-        print(f"[NOTIFY] Показываем: {title} - {message}")
-        self.in_app_toast.show_notification(title, message)
+    def show_notification(self, title: str, message: str, is_group: bool = False):
+        mask_fn = getattr(storage, "should_mask_notifications", None)
+        masked = bool(mask_fn(getattr(state, "username", ""))) if callable(mask_fn) else False
+        if masked:
+            self.in_app_toast.show_notification("Max1m", "🔒 Новое зашифрованное сообщение", is_group=False)
+            return
+        self.in_app_toast.show_notification(title, message, is_group=is_group)
 
     def _on_notification_clicked(self, sender_username: str):
         print(f"[NOTIFY] Клик: {sender_username}")
@@ -1702,59 +2166,54 @@ class AppWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+        if getattr(self, "_vault_locked", False):
+            return
         if self.stack.currentWidget() != self.main_screen:
             self.stack.setCurrentWidget(self.main_screen)
 
-        if hasattr(self.main_screen, "open_chat_by_username"):
+        if sender_username and sender_username != "Max1m" and hasattr(self.main_screen, "open_chat_by_username"):
             self.main_screen.open_chat_by_username(sender_username)
 
     def _on_incoming_group_message(self, data: dict):
         print(f"[WS GROUP] Групповое сообщение: {data.get('group_id')}")
-        if hasattr(self, "main_screen") and self.main_screen is not None:
+        if hasattr(self, "main_screen") and hasattr(self.main_screen, "process_incoming_group_message"):
             self.main_screen.process_incoming_group_message(data)
+        else:
+            print("[GROUPS] Сообщение оставлено на сервере: приём групп временно недоступен")
 
     def _on_group_created_event(self, data: dict):
         print(f"[WS GROUP] Создана группа: {data.get('group_name')}")
-        if hasattr(self, "main_screen") and self.main_screen is not None:
+        if hasattr(self, "main_screen") and hasattr(self.main_screen, "process_group_created_event"):
             self.main_screen.process_group_created_event(data)
+        else:
+            print("[GROUPS] Обновление группы будет загружено при следующем входе")
 
     def _on_group_invited_event(self, data: dict):
         print(f"[WS GROUP] Приглашение в группу: {data.get('group_id')}")
-        if hasattr(self, "main_screen") and self.main_screen is not None:
+        if hasattr(self, "main_screen") and hasattr(self.main_screen, "process_group_created_event"):
             self.main_screen.process_group_created_event(data)
+        else:
+            print("[GROUPS] Обновление группы будет загружено при следующем входе")
 
     def _on_group_member_joined(self, data: dict):
-        print(f"[WS GROUP] Новый участник: {data.get('new_member_device_id')}")
-        group_id = data.get("group_id")
-        if group_id and group_id in state.groups:
-            new_device_id = data.get("new_member_device_id")
-            members = state.groups[group_id].get("members", [])
-            if not any(m.get("device_id") == new_device_id for m in members):
-                members.append({"device_id": new_device_id, "role": "member"})
+        if hasattr(self, "main_screen") and hasattr(self.main_screen, "process_group_member_joined"):
+            self.main_screen.process_group_member_joined(data)
 
     def _on_group_member_left(self, data: dict):
-        print(f"[WS GROUP] Участник вышел: {data.get('left_device_id')}")
-        group_id = data.get("group_id")
-        left_device_id = data.get("left_device_id")
-        rotation_required = data.get("rotation_required", False)
+        if hasattr(self, "main_screen") and hasattr(self.main_screen, "process_group_member_left"):
+            self.main_screen.process_group_member_left(data)
 
-        if not group_id or group_id not in state.groups:
+    def _on_group_sender_key_updated(self, data: dict):
+        if hasattr(self, "main_screen") and hasattr(self.main_screen, "process_group_sender_key_updated"):
+            self.main_screen.process_group_sender_key_updated(data)
+
+    def _on_groups_fetched(self, success: bool, data, worker):
+        worker.wait()
+        if worker is not self.groups_fetch_worker:
             return
-
-        members = state.groups[group_id].get("members", [])
-        state.groups[group_id]["members"] = [
-            m for m in members if m.get("device_id") != left_device_id
-        ]
-
-        state.groups[group_id].get("sender_keys", {}).pop(left_device_id, None)
-
-        if rotation_required:
-            from app.group_crypto import group_crypto
-            new_key = group_crypto.generate_sender_key()
-            state.groups[group_id]["my_sender_key"] = new_key
-            print(f"[GROUP SECURITY] 🔄 SenderKey ротирован для группы {group_id}")
-
-    def _on_groups_fetched(self, success: bool, data):
+        if worker.account_context != (state.username, state.server_url, state.device_id, state.token):
+            return
+        self.groups_fetch_worker = None
         if not success:
             print(f"[GROUPS] Ошибка загрузки групп: {data}")
             return
@@ -1764,228 +2223,652 @@ class AppWindow(QMainWindow):
 
         print(f"[GROUPS] Загружено групп: {len(data)}")
 
-        from app.group_crypto import group_crypto
-        from app.workers import FetchGroupSenderKeysWorker, SyncGroupMessagesWorker
-        from PySide6.QtCore import Qt
-
-        if not hasattr(self, '_sender_key_workers'):
-            self._sender_key_workers = []
-
+        server_ids = set()
         for group_info in data:
             group_id = group_info.get("id")
             if not group_id:
                 continue
+            server_ids.add(group_id)
 
+            srv_name = group_info.get("name", "")
             if group_id not in state.groups:
-                state.groups[group_id] = {
-                    "name": group_info.get("name", ""),
+                disp_name = f"Группа {group_id[:8]}" if srv_name == "[E2EE]" else srv_name
+                entry = {
+                    "name": disp_name,
                     "created_by_device_id": group_info.get("created_by_device_id", ""),
                     "members": group_info.get("members", []),
-                    "my_sender_key": group_crypto.generate_sender_key(),
+                    "archived": False,
+                    "my_sender_key": None,  # No unannounced keys on restart.
                     "sender_keys": {}
                 }
+                if "epoch" in group_info:
+                    entry["epoch"] = int(group_info.get("epoch", 1) or 1)
+                state.groups[group_id] = entry
             else:
+                prev_name = state.groups[group_id].get("name", "")
+                if srv_name and srv_name != "[E2EE]":
+                    state.groups[group_id]["name"] = srv_name
+                elif not prev_name:
+                    state.groups[group_id]["name"] = f"Группа {group_id[:8]}"
+                state.groups[group_id]["created_by_device_id"] = group_info.get(
+                    "created_by_device_id", state.groups[group_id].get("created_by_device_id", "")
+                )
                 state.groups[group_id]["members"] = group_info.get("members", [])
+                state.groups[group_id]["archived"] = False
+                if "epoch" in group_info:
+                    state.groups[group_id]["epoch"] = max(
+                        int(state.groups[group_id].get("epoch", 1) or 1),
+                        int(group_info.get("epoch", 1) or 1),
+                    )
 
-            if hasattr(self, "main_screen"):
+            if hasattr(self, "main_screen") and self.main_screen is not None:
                 existing = self.main_screen._get_group_item(group_id)
                 if not existing:
                     self.main_screen._add_group_card(
                         group_id,
-                        group_info.get("name", "")
+                        state.groups[group_id].get("name", srv_name)
                     )
+                elif hasattr(self.main_screen, "_get_group_card"):
+                    card = self.main_screen._get_group_card(group_id)
+                    if card:
+                        card.setToolTip("")
 
-            worker = FetchGroupSenderKeysWorker(
-                state.server_url,
-                state.token,
-                group_id
-            )
+        for existing_id, group_data in list(state.groups.items()):
+            if existing_id not in server_ids:
+                group_data["archived"] = True
+                group_data["my_sender_key"] = None
+                if hasattr(self, "main_screen") and self.main_screen is not None and hasattr(self.main_screen, "force_remove_group"):
+                    self.main_screen.force_remove_group(existing_id)
 
-            worker.finished.connect(
-                self._on_sender_keys_fetched,
-                Qt.QueuedConnection
-            )
+        if hasattr(self, "main_screen") and self.main_screen is not None and hasattr(self.main_screen, "_persist_groups_index"):
+            self.main_screen._persist_groups_index()
 
-            self._sender_key_workers.append(worker)
-            worker.start()
+        post_sync = getattr(self, "_sync_group_keys_after_fetch", None)
+        if callable(post_sync):
+            post_sync()
 
-        self.group_sync_worker = SyncGroupMessagesWorker(
-            state.server_url,
-            state.token
+    def _refresh_groups_from_server(self):
+        if not state.token or (self.groups_fetch_worker and self.groups_fetch_worker.isRunning()):
+            return
+        from app.workers import FetchGroupsWorker
+
+        w = FetchGroupsWorker(state.server_url, state.token)
+        w.account_context = (state.username, state.server_url, state.device_id, state.token)
+        self.groups_fetch_worker = w
+        w.finished.connect(lambda ok, d, wk=w: self._on_groups_fetched(ok, d, wk), Qt.QueuedConnection)
+        w.start()
+
+    def _sync_group_keys_after_fetch(self):
+        if not state.token or not hasattr(self, "main_screen") or not self.main_screen:
+            return
+        if hasattr(self.main_screen, "restore_persisted_group_keys"):
+            self.main_screen.restore_persisted_group_keys()
+        for gid, gdata in list(state.groups.items()):
+            if not isinstance(gdata, dict) or gdata.get("archived"):
+                continue
+            self.fetch_sender_keys_for_group(gid)
+            if hasattr(self.main_screen, "ensure_my_group_sender_key"):
+                self.main_screen.ensure_my_group_sender_key(gid)
+        self._start_group_sync()
+
+    def fetch_sender_keys_for_group(self, group_id: str):
+        if not state.token or not group_id or not hasattr(self, "main_screen") or not self.main_screen:
+            return
+        from app.workers import FetchGroupSenderKeysWorker
+
+        w = FetchGroupSenderKeysWorker(state.server_url, state.token, group_id)
+        w.account_context = (state.username, state.server_url, state.device_id, state.token)
+        w.finished.connect(
+            lambda ok, d, gid, wk=w: self._on_sender_keys_fetched(ok, d, gid, wk),
+            Qt.QueuedConnection,
         )
+        self.main_screen._net_workers.append(w)
+        w.start()
 
-        self.group_sync_worker.finished.connect(
-            self._on_group_sync_finished,
-            Qt.QueuedConnection
+    def _start_group_sync(self):
+        if not state.token or not state.groups:
+            return
+        if self._group_sync_worker and self._group_sync_worker.isRunning():
+            return
+        from app.workers import SyncGroupMessagesWorker
+
+        w = SyncGroupMessagesWorker(state.server_url, state.token)
+        w.account_context = (state.username, state.server_url, state.device_id, state.token)
+        self._group_sync_worker = w
+        w.finished.connect(
+            lambda ok, msgs, wk=w: self._on_group_sync_finished(ok, msgs, wk),
+            Qt.QueuedConnection,
         )
+        if hasattr(self, "main_screen") and self.main_screen:
+            self.main_screen._net_workers.append(w)
+        w.start()
 
-        self.group_sync_worker.start()
+    def _on_group_sync_finished(self, success: bool, messages, worker=None):
+        if worker is not None:
+            worker.wait()
+            if hasattr(self, "main_screen") and self.main_screen and worker in self.main_screen._net_workers:
+                self.main_screen._net_workers.remove(worker)
+            if worker is self._group_sync_worker:
+                self._group_sync_worker = None
+            if getattr(worker, "account_context", None) != (
+                state.username, state.server_url, state.device_id, state.token
+            ):
+                return
 
-    def _on_group_sync_finished(self, success: bool, messages):
-        if not success:
-            print(f"[GROUPS SYNC] Ошибка: {messages}")
+        if not success or not isinstance(messages, list) or not messages:
             return
 
-        if not isinstance(messages, list) or not messages:
-            print("[GROUPS SYNC] Пропущенных групповых сообщений нет.")
-            return
-
-        print(f"[GROUPS SYNC] Получено {len(messages)} групповых сообщений.")
-        if hasattr(self, "main_screen") and self.main_screen is not None:
+        if hasattr(self, "main_screen") and hasattr(self.main_screen, "process_incoming_group_message"):
+            acked_ids = []
             for msg in messages:
-                self.main_screen.process_incoming_group_message(msg)
+                # process_incoming_group_message(_from_deferred=True) avoids per-msg ACK so we batch-ACK here!
+                if self.main_screen.process_incoming_group_message(msg, _from_deferred=True):
+                    mid = msg.get("id") or msg.get("message_id")
+                    if mid:
+                        acked_ids.append(mid)
+            if acked_ids and hasattr(self.main_screen, "_queue_group_ack"):
+                self.main_screen._queue_group_ack(acked_ids)
 
-    def _on_sender_keys_fetched(self, success, data, group_id):
-        if not success:
-            print(f"[GROUPS] Ошибка загрузки SenderKeys для {group_id}: {data}")
+    def _on_sender_keys_fetched(self, success, data, group_id, worker=None):
+        if worker is not None:
+            worker.wait()
+            if hasattr(self, "main_screen") and self.main_screen and worker in self.main_screen._net_workers:
+                self.main_screen._net_workers.remove(worker)
+            if getattr(worker, "account_context", None) != (
+                state.username, state.server_url, state.device_id, state.token
+            ):
+                return
+        if not success or not isinstance(data, list) or group_id not in state.groups:
             return
-
-        if not isinstance(data, list):
-            return
-
-        print(f"[GROUPS] SenderKeys для {group_id}: {len(data)}")
-
-        from app.group_crypto import group_crypto
-
-        for entry in data:
-            sender_device_id = entry.get("sender_device_id")
-            encrypted_sender_key = entry.get("encrypted_sender_key")
-            sender_key_signature = entry.get("sender_key_signature", "")
-
-            if not sender_device_id or not encrypted_sender_key:
-                continue
-
-            if group_id not in state.groups:
-                continue
-
-            if sender_device_id in state.groups[group_id]["sender_keys"]:
-                continue
-
-            sender_pub_key = None
-            if hasattr(self, "main_screen"):
-                sender_pub_key = self.main_screen._find_public_key_by_device_id(
-                    sender_device_id
-                )
-
-            if not sender_pub_key:
-                continue
-
-            decrypted_key = group_crypto.decrypt_sender_key(
-                encrypted_sender_key,
-                sender_key_signature,
-                sender_pub_key
-            )
-
-            if decrypted_key:
-                state.groups[group_id]["sender_keys"][sender_device_id] = decrypted_key
-                print(f"[GROUPS] ✓ SenderKey: {sender_device_id} → {group_id}")
-
-    def _on_rtc_state_change(self, peer_device_id: str, state: str):
-        """Состояние WebRTC peer connection."""
-        print(f"[AppWindow] 📡 RTC state: peer={peer_device_id}, state={state}")
-
         if not hasattr(self, "main_screen") or not self.main_screen:
             return
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            self.main_screen.ingest_sender_key_entry(
+                group_id=group_id,
+                sender_device_id=entry.get("sender_device_id", ""),
+                encrypted_sender_key=entry.get("encrypted_sender_key", ""),
+                sender_key_signature=entry.get("sender_key_signature", ""),
+                epoch=int(entry.get("epoch", 1) or 1),
+            )
 
+    def _on_rtc_state_change(self, peer_device_id: str, call_id: str, status: str):
+        # aiortc calls this on its worker thread; never manipulate Qt there.
+        self.rtc_state_changed.emit(peer_device_id, call_id, status)
+
+    def _apply_rtc_state_change(self, peer_device_id: str, call_id: str, status: str):
+        if (not hasattr(self, "main_screen") or not self.main_screen
+                or self.main_screen._active_call_id != call_id
+                or self.main_screen._active_call_device_id != peer_device_id):
+            return
         handler = getattr(self.main_screen, "_update_rtc_state", None)
         if callable(handler):
-            handler(peer_device_id, state)
+            handler(peer_device_id, status)
 
     def _on_screen_share_state(self, active: bool, quality: str):
+        self.rtc_screen_state_changed.emit(bool(active), str(quality or "balanced"))
+
+    def _apply_screen_share_state(self, active: bool, quality: str):
         if not hasattr(self, "main_screen") or not self.main_screen:
             return
         handler = getattr(self.main_screen, "_update_screen_share_ui", None)
         if callable(handler):
             handler(active, quality)
 
+    def _on_remote_screen_state(self, peer_device_id: str, call_id: str, active: bool):
+        self.rtc_remote_screen_state_changed.emit(str(peer_device_id), str(call_id), bool(active))
+
+    def _apply_remote_screen_state(self, peer_device_id: str, call_id: str, active: bool):
+        screen = getattr(self, "main_screen", None)
+        if not screen:
+            return
+        if not active:
+            if screen._active_call_device_id in (None, peer_device_id):
+                stopper = getattr(screen, "_on_screen_share_stopped", None)
+                if callable(stopper):
+                    stopper(peer_device_id)
+            return
+        if screen._active_call_id != call_id or screen._active_call_device_id != peer_device_id:
+            return
+        starter = getattr(screen, "_on_screen_share_started", None)
+        if callable(starter):
+            starter(peer_device_id)
+
+    def _on_rtc_screen_frame(self, peer_device_id: str, call_id: str, rgb_array, fps: float):
+        should_emit = False
+        with self._screen_frame_lock:
+            self._screen_frame_mailbox = (peer_device_id, call_id, rgb_array, float(fps or 0.0))
+            if not self._screen_frame_ui_queued:
+                self._screen_frame_ui_queued = True
+                should_emit = True
+        if should_emit:
+            self.rtc_screen_frame_ready.emit()
+
+    def _drain_latest_screen_frame(self):
+        with self._screen_frame_lock:
+            item = self._screen_frame_mailbox
+            self._screen_frame_mailbox = None
+            self._screen_frame_ui_queued = False
+        if not item:
+            return
+        peer_device_id, call_id, rgb_array, fps = item
+        screen = getattr(self, "main_screen", None)
+        if (
+            not screen
+            or screen._active_call_id != call_id
+            or screen._active_call_device_id != peer_device_id
+        ):
+            return
+        handler = getattr(screen, "_on_screen_frame_numpy", None)
+        if callable(handler):
+            handler(rgb_array, fps=fps)
+
+    def _verified_call_event(self, data):
+        """Reject unsigned, misaddressed, stale and replayed signaling."""
+        try:
+            sender = data.get("from_device_id")
+            context = resolve_call_peer(state, sender)
+            if context is None:
+                return None
+            event = call_envelope.open_envelope(crypto, data, state.device_id, context.public_key)
+            screen = getattr(self, "main_screen", None)
+            if not screen:
+                return None
+            if event["kind"] == "call_offer":
+                if not call_envelope.remember_offer(state.username, state.server_url, state.device_id,
+                                                    sender, event["call_id"]):
+                    return None
+            else:
+                pinned = screen._active_call_context
+                # A pre-verification hangup may dismiss a ringing offer, but
+                # SDP/ICE and acceptance require the original verified key.
+                if (context != pinned or not call_context_valid(state, pinned, event["kind"] != "call_ended")
+                        or screen._active_call_device_id != sender or
+                        screen._active_call_id != event["call_id"]):
+                    return None
+                scope = (sender, event["call_id"])
+                if getattr(self, "_call_seen_scope", None) != scope:
+                    self._call_seen_scope, self._call_seen_events = scope, set()
+                if event["event_id"] in self._call_seen_events or len(self._call_seen_events) >= 4096:
+                    return None
+                self._call_seen_events.add(event["event_id"])
+            event["peer_context"] = context
+            return event
+        except Exception as e:
+            print(f"[CALL] Сигнал отклонён: {type(e).__name__}")
+            return None
+
+    def _send_call_event(self, kind, recipient, call_id, content=None):
+        try:
+            screen = getattr(self, "main_screen", None)
+            pinned = getattr(screen, "_active_call_context", None)
+            if (not screen or pinned is None or pinned.device_id != recipient
+                    or screen._active_call_id != call_id
+                    or not call_context_valid(state, pinned, kind != "call_ended")
+                    or not getattr(self, "ws_worker", None)):
+                return False
+            envelope = call_envelope.seal(crypto, kind, state.device_id, recipient, call_id, pinned.public_key, content)
+            return self.ws_worker.send_signal(envelope)
+        except Exception as e:
+            print(f"[CALL] Ошибка подготовки сигнала: {type(e).__name__}")
+            return False
+
     def _on_webrtc_signal(self, data: dict):
-        """Входящий зашифрованный WebRTC сигнал."""
-        print(
-            f"[AppWindow] 🔒 webrtc_signal "
-            f"type={data.get('type')} from={data.get('from_device_id')} "
-            f"to={data.get('to_device_id')}"
-        )
-        rtc.handle_encrypted_signal(data)
+        event = self._verified_call_event(data)
+        screen = getattr(self, "main_screen", None)
+        if not event or not screen or not allow_webrtc_signal(
+            event["sender"], screen._active_call_device_id, screen._call_signal_authorized,
+        ):
+            return
+        inner = event.get("content")
+        if (not isinstance(inner, dict) or inner.get("type") != "webrtc_signal"
+                or inner.get("to_device_id") != state.device_id):
+            return
+        rtc.handle_encrypted_signal({**inner, "from_device_id": event["sender"]}, event["call_id"])
 
     def _on_call_accepted(self, data: dict):
-        """Собеседник принял звонок."""
-        print(f"[AppWindow] ✅ call_accept от {data.get('from_device_id')}")
-
-        if hasattr(self, "main_screen") and self.main_screen:
-            handler = getattr(self.main_screen, "_on_call_accepted", None)
-            if callable(handler):
-                handler(data)
+        event = self._verified_call_event(data)
+        if event and getattr(self, "main_screen", None):
+            self.main_screen._on_call_accepted({"from_device_id": event["sender"]})
 
     def _get_peer_public_key(self, device_id: str):
-        """
-        Жёсткий поиск публичного ключа устройства.
-        Не зависит от main_screen helper'ов.
-        """
-        try:
-            # 1. Ищем среди союзников
-            for username, ally_data in state.allies.items():
-                for dev in ally_data.get("devices", []):
-                    if dev.get("device_id") == device_id:
-                        pub = dev.get("public_key")
-                        if pub:
-                            print(f"[AppWindow] 🔑 pubkey найден для {device_id} через ally @{username}")
-                            return pub
-
-            # 2. Если текущий чат с этим устройством — дополнительная проверка
-            if state.current_chat_type == "ally" and state.current_chat_device_id == device_id:
-                ally = state.allies.get(state.current_chat_username)
-                if ally:
-                    for dev in ally.get("devices", []):
-                        if dev.get("device_id") == device_id:
-                            pub = dev.get("public_key")
-                            if pub:
-                                print(f"[AppWindow] 🔑 pubkey найден для current_chat {device_id}")
-                                return pub
-
-            print(f"[AppWindow] ❌ pubkey НЕ найден для {device_id}")
-            return None
-
-        except Exception as e:
-            print(f"[AppWindow] ❌ _get_peer_public_key: {e}")
-            return None
+        # Called by the WebRTC thread too. Never use the first of ambiguous IDs,
+        # or a replacement key after the call has started.
+        screen = getattr(self, "main_screen", None)
+        pinned = getattr(screen, "_active_call_context", None)
+        if (pinned and pinned.device_id == device_id
+                and call_context_valid(state, pinned, True)):
+            return pinned.public_key
+        return None
 
     def _on_call_ended(self, data: dict):
-        """Удалённая сторона завершила звонок."""
-        print(f"[AppWindow] 📴 call_ended от {data.get('from_device_id')}")
-
-        if hasattr(self, "main_screen") and self.main_screen:
-            handler = getattr(self.main_screen, "_on_remote_call_ended", None)
-            if callable(handler):
-                handler(data)
-
+        event = self._verified_call_event(data)
+        if event and getattr(self, "main_screen", None):
+            self.main_screen._on_remote_call_ended({"from_device_id": event["sender"]})
 
     def _send_rtc_signal(self, data: dict):
-        """Отправка WebRTC сигналинга через WebSocketWorker."""
-        if hasattr(self, "ws_worker") and self.ws_worker:
-            self.ws_worker.send_signal(data)
-        else:
-            print(f"[AppWindow] ⚠️ ws_worker не готов для сигнала: {data.get('type')}")
+        screen = getattr(self, "main_screen", None)
+        if (screen and screen._call_signal_authorized and data.get("type") == "webrtc_signal"
+                and data.get("to_device_id") == screen._active_call_device_id
+                and data.get("_local_call_id") == screen._active_call_id):
+            inner = {key: value for key, value in data.items() if key != "_local_call_id"}
+            self._send_call_event("webrtc_signal", screen._active_call_device_id,
+                                  screen._active_call_id, inner)
 
     def _on_call_offer(self, data: dict):
-        """Входящий вызов."""
-        print(f"[AppWindow] 📞 call_offer от {data.get('from_device_id')}")
+        event = self._verified_call_event(data)
+        if event and getattr(self, "main_screen", None):
+            self.main_screen._on_incoming_call({"from_device_id": event["sender"],
+                                                "call_id": event["call_id"],
+                                                "peer_context": event["peer_context"]})
 
-        if hasattr(self, "main_screen") and self.main_screen:
-            handler = getattr(self.main_screen, "_on_incoming_call", None)
-            if callable(handler):
-                handler(data)
-            else:
-                print("[AppWindow] ⚠️ main_screen._on_incoming_call отсутствует")
+    def _handle_remote_session_invalidated(self, reason: str = ""):
+        """Immediately lock local session when server confirms token/device invalidation (HTTP 401/403)."""
+        if not getattr(state, "token", ""):
+            return
+        storage_obj = globals().get("storage")
+        crypto_obj = globals().get("crypto")
+        rtc_obj = globals().get("rtc")
 
-    def closeEvent(self, event):
+        save_profile = getattr(storage_obj, "save_profile_device", None)
+        if callable(save_profile) and getattr(state, "username", "") and getattr(state, "server_url", "") and getattr(state, "device_id", ""):
+            try:
+                pub = crypto_obj.get_public_key_b64() if crypto_obj is not None and getattr(crypto_obj, "public_key", None) else None
+                save_profile(state.username, state.server_url, state.device_id, getattr(state, "device_name", ""), pub)
+            except Exception:
+                pass
+
+        if getattr(self, "_sync_timer", None):
+            self._sync_timer.stop()
+
+        # Clear token first so any in-flight worker callbacks reject stale account_context
+        # and outbox/attachment timers refuse to start new network requests.
+        state.token = ""
+        self._sync_cursor = None
+        self._sync_restart_requested = False
+
+        screen = getattr(self, "main_screen", None)
+        if screen is not None:
+            history_worker = getattr(screen, "_history_worker", None)
+            if history_worker is not None:
+                screen._history_pending = None
+                cancel_fn = getattr(history_worker, "cancel", None)
+                if callable(cancel_fn):
+                    cancel_fn()
+            if getattr(screen, "_media_queue", None) is not None and hasattr(screen._media_queue, "reset"):
+                screen._media_queue.reset()
+            if getattr(screen, "_is_recording", False) or (getattr(screen, "_voice_thread", None) and screen._voice_thread.is_alive()):
+                screen._cancel_voice_recording()
+            if getattr(screen, "_voice_playback", None) is not None:
+                screen._stop_voice_playback()
+                screen._voice_playback.stop_and_wait(0.2)
+            if getattr(screen, "_in_call", False) and hasattr(screen, "_end_call"):
+                try:
+                    screen._end_call()
+                except Exception:
+                    pass
+        if rtc_obj is not None and hasattr(rtc_obj, "end_call"):
+            try:
+                rtc_obj.end_call()
+            except Exception:
+                pass
+
+        ws = getattr(self, "ws_worker", None)
+        if ws is not None:
+            ws.stop()
+            ws.wait(2000)
+            self.ws_worker = None
+
+        if screen is not None and hasattr(screen, "reset_session_view"):
+            screen.reset_session_view()
+
+        state.current_chat_username = None
+        state.current_chat_device_id = None
+        state.current_group_id = None
+        state.current_chat_type = "ally"
+        if hasattr(state, "allies") and hasattr(state.allies, "clear"):
+            state.allies.clear()
+        if hasattr(state, "groups") and hasattr(state.groups, "clear"):
+            state.groups.clear()
+        if crypto_obj is not None:
+            crypto_obj.private_key = None
+            crypto_obj.public_key = None
+
+        if hasattr(self, "password_block") and isinstance(self.password_block, dict) and "input" in self.password_block:
+            self.password_block["input"].clear()
+        if hasattr(self, "_set_mode"):
+            self._set_mode("login")
+        if hasattr(self, "stack") and hasattr(self, "auth_screen"):
+            self.stack.setCurrentWidget(self.auth_screen)
+        if hasattr(self, "_update_auth_animation_state"):
+            self._update_auth_animation_state()
+        if hasattr(self, "_set_status"):
+            self._set_status(
+                reason or "Сессия истекла или устройство отозвано. Выполните вход снова.",
+                True,
+            )
+
+    def logout_session(self) -> bool:
+        auth_worker = getattr(self, "worker", None)
+        if auth_worker and auth_worker.isRunning():
+            QMessageBox.warning(self, "Запрос выполняется", "Дождитесь завершения авторизации перед выходом.")
+            return False
+        screen = getattr(self, "main_screen", None)
+        if screen is not None:
+            if (any(w.isRunning() for w in getattr(screen, "_net_workers", ()))
+                    or (getattr(screen, "find_worker", None) and screen.find_worker.isRunning())
+                    or (getattr(screen, "_outbox_worker", None) and screen._outbox_worker.isRunning())):
+                QMessageBox.warning(self, "Сетевой запрос выполняется", "Дождитесь завершения отправки или загрузки перед выходом из сессии.")
+                return False
+            settings_view = getattr(screen, "settings_screen", None)
+            if settings_view and any(w.isRunning() for w in getattr(settings_view, "_net_workers", ())):
+                QMessageBox.warning(self, "Запрос безопасности выполняется", "Дождитесь завершения операции с устройствами перед выходом.")
+                return False
+            if getattr(screen, "_media_queue", None) and screen._media_queue.active:
+                screen._media_queue.reset()
+                QMessageBox.warning(self, "Вложения ещё скачиваются", "Дождитесь завершения текущих загрузок и повторите выход.")
+                return False
+            history_worker = getattr(screen, "_history_worker", None)
+            if history_worker is not None:
+                screen._history_pending = None
+                history_worker.cancel()
+                if history_worker.isRunning() and not history_worker.wait(300):
+                    QMessageBox.warning(self, "История ещё читается", "Повторите выход через секунду.")
+                    return False
+        for bg in (getattr(self, "sync_worker", None), getattr(self, "_ack_worker", None), getattr(self, "groups_fetch_worker", None)):
+            if bg and bg.isRunning() and not bg.wait(200):
+                QMessageBox.warning(self, "Синхронизация выполняется", "Дождитесь завершения фоновой синхронизации и повторите выход.")
+                return False
+
+        # Ensure current profile's device_id is durably recorded in its own profile before switching users.
+        save_profile = getattr(storage, "save_profile_device", None)
+        if callable(save_profile) and getattr(state, "username", "") and getattr(state, "server_url", "") and getattr(state, "device_id", ""):
+            try:
+                pub = crypto.get_public_key_b64() if getattr(crypto, "public_key", None) else None
+                save_profile(state.username, state.server_url, state.device_id, getattr(state, "device_name", ""), pub)
+            except Exception:
+                pass
+
+        if getattr(self, "_sync_timer", None):
+            self._sync_timer.stop()
+        if screen is not None:
+            if getattr(screen, "_is_recording", False) or (getattr(screen, "_voice_thread", None) and screen._voice_thread.is_alive()):
+                screen._cancel_voice_recording()
+            if getattr(screen, "_voice_playback", None) is not None:
+                screen._stop_voice_playback()
+                screen._voice_playback.stop_and_wait(0.2)
+            if getattr(screen, "_in_call", False) and hasattr(screen, "_end_call"):
+                try:
+                    screen._end_call()
+                except Exception:
+                    pass
         try:
-            if hasattr(self, "ws_worker") and self.ws_worker:
-                self.ws_worker.stop()
-                self.ws_worker.wait(2000)
+            rtc.end_call()
         except Exception:
             pass
+
+        ws = getattr(self, "ws_worker", None)
+        if ws is not None:
+            ws.stop()
+            ws.wait(2000)
+            self.ws_worker = None
+
+        self._sync_cursor = None
+        if screen is not None and hasattr(screen, "reset_session_view"):
+            screen.reset_session_view()
+
+        prev_server_url = getattr(state, "server_url", "")
+        prev_token = getattr(state, "token", "")
+
+        state.token = ""
+        state.current_chat_username = None
+        state.current_chat_device_id = None
+        state.current_group_id = None
+        state.current_chat_type = "ally"
+        state.allies.clear()
+        state.groups.clear()
+        crypto.private_key = None
+        crypto.public_key = None
+        _zeroize_fn = getattr(self, "_zeroize_local_vaults", None)
+        if callable(_zeroize_fn):
+            _zeroize_fn()
+
+        logout_worker_cls = globals().get("LogoutSessionWorker")
+        if logout_worker_cls is not None and isinstance(prev_server_url, str) and prev_server_url and isinstance(prev_token, str) and prev_token:
+            try:
+                if not hasattr(self, "_logout_workers") or self._logout_workers is None:
+                    self._logout_workers = []
+                lw = logout_worker_cls(prev_server_url, prev_token)
+                self._logout_workers.append(lw)
+
+                def _cleanup_lw(_ok=False, _res=None, w=lw):
+                    w.wait()
+                    workers_list = getattr(self, "_logout_workers", None)
+                    if isinstance(workers_list, list) and w in workers_list:
+                        workers_list.remove(w)
+
+                qt_mod = globals().get("Qt")
+                if qt_mod is not None and hasattr(qt_mod, "QueuedConnection"):
+                    lw.finished.connect(_cleanup_lw, qt_mod.QueuedConnection)
+                else:
+                    lw.finished.connect(_cleanup_lw)
+                lw.start()
+            except Exception:
+                pass
+
+        if hasattr(self, "password_block") and isinstance(self.password_block, dict) and "input" in self.password_block:
+            self.password_block["input"].clear()
+        if hasattr(self, "_set_mode"):
+            self._set_mode("login")
+        if hasattr(self, "stack") and hasattr(self, "auth_screen"):
+            self.stack.setCurrentWidget(self.auth_screen)
+        if hasattr(self, "_update_auth_animation_state"):
+            self._update_auth_animation_state()
+        if hasattr(self, "_set_status"):
+            self._set_status("Сессия завершена. Выполните вход.", False)
+        return True
+
+    def closeEvent(self, event):
+        # A result not processed before shutdown remains on disk and is safe to
+        # retry; wait for the short HTTP timeout to avoid destroying a live QThread.
+        auth_worker = getattr(self, "worker", None)
+        if auth_worker and auth_worker.isRunning():
+            QMessageBox.warning(self, "Вход или регистрация выполняется", "Дождитесь завершения запроса и попробуйте закрыть приложение снова.")
+            event.ignore()
+            return
+        screen = getattr(self, "main_screen", None)
+        if screen:
+            voice_thread = getattr(screen, "_voice_thread", None)
+            if getattr(screen, "_is_recording", False) or (voice_thread and voice_thread.is_alive()):
+                screen._cancel_voice_recording()
+                if voice_thread and voice_thread.is_alive():
+                    QMessageBox.warning(self, "Микрофон ещё закрывается", "Дождитесь остановки записи и попробуйте закрыть приложение снова.")
+                    event.ignore()
+                    return
+            playback = getattr(screen, "_voice_playback", None)
+            if playback is not None:
+                screen._stop_voice_playback()
+                if not playback.stop_and_wait(0.3):
+                    QMessageBox.warning(self, "Воспроизведение останавливается", "Дождитесь остановки аудиоустройства и попробуйте закрыть приложение снова.")
+                    event.ignore()
+                    return
+            find_worker = getattr(screen, "find_worker", None)
+            if find_worker and find_worker.isRunning():
+                QMessageBox.warning(self, "Поиск выполняется", "Дождитесь завершения запроса и попробуйте закрыть приложение снова.")
+                event.ignore()
+                return
+            # Upload/grant callbacks must complete while their QThreads and
+            # in-memory attachment state are still alive.
+            if any(hasattr(w, "recipient_context") for w in screen._net_workers):
+                QMessageBox.warning(self, "Вложение ещё обрабатывается", "Дождитесь завершения загрузки и выдачи доступа, затем закройте приложение.")
+                event.ignore()
+                return
+            if any(getattr(w, "group_id", None) and hasattr(w, "account_context") and w.isRunning()
+                   for w in screen._net_workers):
+                QMessageBox.warning(self, "Запрос группы выполняется", "Дождитесь завершения запроса и попробуйте закрыть приложение снова.")
+                event.ignore()
+                return
+            if any(w.isRunning() for w in screen._net_workers):
+                QMessageBox.warning(self, "Сетевой запрос выполняется", "Дождитесь завершения запроса и попробуйте закрыть приложение снова.")
+                event.ignore()
+                return
+            settings_view = getattr(screen, "settings_screen", None)
+            if settings_view and any(w.isRunning() for w in getattr(settings_view, "_net_workers", ())):
+                QMessageBox.warning(self, "Запрос безопасности выполняется", "Дождитесь завершения обновления или отзыва устройства и закройте приложение снова.")
+                event.ignore()
+                return
+            group_fetch = getattr(self, "groups_fetch_worker", None)
+            if group_fetch and group_fetch.isRunning():
+                QMessageBox.warning(self, "Загрузка групп выполняется", "Дождитесь завершения запроса и попробуйте закрыть приложение снова.")
+                event.ignore()
+                return
+            if screen._media_queue.active:
+                screen._media_queue.reset()  # discard queued work; active HTTP requests must finish
+                QMessageBox.warning(self, "Вложения ещё загружаются", "Дождитесь завершения текущих загрузок и попробуйте закрыть приложение снова.")
+                event.ignore()
+                return
+            history_worker = getattr(screen, "_history_worker", None)
+            if history_worker:
+                # Even a completed worker may have a queued finished callback.
+                screen._history_pending = None
+                history_worker.cancel()
+                if history_worker.isRunning() and not history_worker.wait(300):
+                    QMessageBox.warning(self, "История ещё открывается", "Дождитесь остановки чтения истории и попробуйте закрыть приложение снова.")
+                    event.ignore()
+                    return
+            screen._outbox_timer.stop()
+            worker = screen._outbox_worker
+            if worker and worker.isRunning() and not worker.wait(11000):
+                screen._outbox_timer.start()
+                QMessageBox.warning(self, "Отправка ещё выполняется", "Подождите завершения запроса и попробуйте закрыть приложение снова.")
+                event.ignore()
+                return
+        for worker in (self.sync_worker, self._ack_worker):
+            if worker and worker.isRunning() and not worker.wait(100):
+                if screen:
+                    screen._outbox_timer.start()
+                QMessageBox.warning(self, "Синхронизация выполняется", "Дождитесь завершения сетевого запроса и попробуйте закрыть приложение снова.")
+                event.ignore()
+                return
+        if getattr(self, "ws_worker", None):
+            self.ws_worker.stop()
+            if not self.ws_worker.wait(5000):
+                if screen:
+                    screen._outbox_timer.start()
+                QMessageBox.warning(self, "Соединение закрывается", "Дождитесь закрытия соединения и попробуйте снова.")
+                event.ignore()
+                return
+        for lw in list(getattr(self, "_logout_workers", ()) or ()):
+            if lw and lw.isRunning() and not lw.wait(1000):
+                QMessageBox.warning(self, "Завершение сессии", "Дождитесь отзыва сессии на сервере и закройте приложение снова.")
+                event.ignore()
+                return
         try:
             rtc.shutdown()
         except Exception:
             pass
+        _zeroize_fn = getattr(self, "_zeroize_local_vaults", None)
+        if callable(_zeroize_fn):
+            _zeroize_fn()
         super().closeEvent(event)
