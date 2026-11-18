@@ -590,6 +590,8 @@ class GroupVoiceRoomController:
         self._screen_recv_session: Optional[object] = None
 
         self._audio_running = False
+        self.input_device_index: Optional[int] = None
+        self.output_device_index: Optional[int] = None
         self._pa = None
         self._in_stream = None
         self._out_stream = None
@@ -638,9 +640,41 @@ class GroupVoiceRoomController:
             self._screen_thread.start()
             s_ready.wait(timeout=3.0)
 
-    def _start_hardware_audio(self) -> None:
+    def _report_audio_error(self, message: str) -> None:
+        if self._on_error:
+            try:
+                self._on_error(message)
+            except Exception:
+                logger.debug("Group voice audio error callback failed")
+
+    def _open_audio_stream(self, *, is_input: bool, device_index: Optional[int]):
+        options = {
+            "format": self._pa_format,
+            "channels": CHANNELS,
+            "rate": RATE,
+            "frames_per_buffer": CHUNK_SAMPLES,
+            "input" if is_input else "output": True,
+        }
+        device_arg = "input_device_index" if is_input else "output_device_index"
+        if device_index is not None:
+            options[device_arg] = device_index
+        try:
+            return self._pa.open(**options)
+        except Exception as selected_exc:
+            if device_index is None:
+                logger.warning("Group voice %s stream unavailable (%s)", "input" if is_input else "output", type(selected_exc).__name__)
+                return None
+            logger.warning("Selected group voice %s device unavailable; trying system default (%s)", "input" if is_input else "output", type(selected_exc).__name__)
+            options.pop(device_arg, None)
+            try:
+                return self._pa.open(**options)
+            except Exception as default_exc:
+                logger.warning("Default group voice %s stream unavailable (%s)", "input" if is_input else "output", type(default_exc).__name__)
+                return None
+
+    def _start_hardware_audio(self) -> bool:
         if self._audio_running:
-            return
+            return True
         try:
             import pyaudio
         except ImportError:
@@ -649,29 +683,34 @@ class GroupVoiceRoomController:
             except ImportError:
                 pyaudio = None
         if pyaudio is None or not hasattr(pyaudio, "PyAudio"):
-            return
+            self._report_audio_error("Аудиомодуль не найден. Проверьте установку PyAudioWPatch/PyAudio.")
+            return False
+
         try:
             self._pa = pyaudio.PyAudio()
-            self._in_stream = self._pa.open(
-                format=pyaudio.paInt16,
-                channels=CHANNELS,
-                rate=RATE,
-                input=True,
-                frames_per_buffer=CHUNK_SAMPLES,
-            )
-            self._out_stream = self._pa.open(
-                format=pyaudio.paInt16,
-                channels=CHANNELS,
-                rate=RATE,
-                output=True,
-                frames_per_buffer=CHUNK_SAMPLES,
-            )
+            self._pa_format = pyaudio.paInt16
         except Exception as exc:
-            logger.warning("Group voice hardware audio unavailable (%s); continuing headless", exc)
+            logger.warning("Group voice audio initialization failed (%s)", type(exc).__name__)
             self._stop_hardware_audio()
-            return
+            self._report_audio_error("Не удалось инициализировать аудиоустройство для голосовой комнаты.")
+            return False
 
-        self._audio_running = True
+        self._in_stream = self._open_audio_stream(
+            is_input=True, device_index=self.input_device_index
+        )
+        self._out_stream = self._open_audio_stream(
+            is_input=False, device_index=self.output_device_index
+        )
+        self._audio_running = bool(self._in_stream is not None or self._out_stream is not None)
+        if not self._audio_running:
+            self._stop_hardware_audio()
+            self._report_audio_error("Не удалось открыть ни микрофон, ни динамики. Голосовая передача недоступна.")
+            return False
+
+        if self._in_stream is None:
+            self._report_audio_error("Микрофон недоступен. В голосовую комнату будет передаваться тишина.")
+        if self._out_stream is None:
+            self._report_audio_error("Динамики недоступны. Входящий звук не будет воспроизводиться.")
 
         def _cap():
             while self._audio_running and self._in_stream is not None:
@@ -696,10 +735,15 @@ class GroupVoiceRoomController:
                 except Exception:
                     time.sleep(0.01)
 
-        self._cap_thread = threading.Thread(target=_cap, name="Max1mGroupMicCap", daemon=True)
-        self._play_thread = threading.Thread(target=_play, name="Max1mGroupSpkMix", daemon=True)
-        self._cap_thread.start()
-        self._play_thread.start()
+        self._cap_thread = None
+        self._play_thread = None
+        if self._in_stream is not None:
+            self._cap_thread = threading.Thread(target=_cap, name="Max1mGroupMicCap", daemon=True)
+            self._cap_thread.start()
+        if self._out_stream is not None:
+            self._play_thread = threading.Thread(target=_play, name="Max1mGroupSpkMix", daemon=True)
+            self._play_thread.start()
+        return True
 
     def _stop_hardware_audio(self) -> None:
         self._audio_running = False
@@ -738,6 +782,21 @@ class GroupVoiceRoomController:
                 if isinstance(v, (int, float)):
                     self.mixer.set_peer_volume(pid, float(v))
 
+    def set_audio_devices(
+        self,
+        input_device_index: Optional[int],
+        output_device_index: Optional[int],
+    ) -> None:
+        changed = (
+            self.input_device_index != input_device_index
+            or self.output_device_index != output_device_index
+        )
+        self.input_device_index = input_device_index
+        self.output_device_index = output_device_index
+        if changed and self.active_group_id:
+            self._stop_hardware_audio()
+            self._start_hardware_audio()
+
     def start_local_session(
         self,
         group_id: str,
@@ -745,9 +804,19 @@ class GroupVoiceRoomController:
         our_username: str,
         initial_participants: List[dict],
         audio_prefs: Optional[dict] = None,
+        input_device_index: Optional[int] = None,
+        output_device_index: Optional[int] = None,
     ) -> None:
         if self.active_group_id and self.active_group_id != group_id:
             self.leave_local_session()
+        device_changed = (
+            self.input_device_index != input_device_index
+            or self.output_device_index != output_device_index
+        )
+        self.input_device_index = input_device_index
+        self.output_device_index = output_device_index
+        if device_changed and self._audio_running:
+            self._stop_hardware_audio()
         self.active_group_id = group_id
         self.our_device_id = our_device_id
         self.our_username = our_username

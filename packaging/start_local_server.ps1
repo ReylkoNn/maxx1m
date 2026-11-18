@@ -120,12 +120,17 @@ if (-not (Test-Path $ShortVenvPy)) {
     Write-Host "[1/3] Creating short-path backend virtualenv ($TargetVer): $ShortVenvDir ..." -ForegroundColor Cyan
     & $BasePy -m venv $ShortVenvDir
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    & $ShortVenvPy -m pip install --upgrade pip wheel
-    & $ShortVenvPy -m pip install -r (Join-Path $BackendDir "requirements.txt")
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
 $PyExe = $ShortVenvPy
+Write-Host "[1/3] Installing backend dependencies from binary wheels only ..." -ForegroundColor Cyan
+& $PyExe -m pip install --upgrade --only-binary=:all: pip wheel
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& $PyExe -m pip install --only-binary=:all: -r (Join-Path $BackendDir "requirements.txt")
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] A required backend wheel is unavailable for Python $TargetVer." -ForegroundColor Red
+    exit $LASTEXITCODE
+}
 
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"

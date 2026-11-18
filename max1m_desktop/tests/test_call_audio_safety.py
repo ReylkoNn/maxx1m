@@ -6,12 +6,17 @@ from types import SimpleNamespace
 import pytest
 
 
+class AudioDeviceUnavailableError(RuntimeError):
+    pass
+
+
 def load_create(env):
     source = Path(__file__).resolve().parents[1] / "app/webrtc_manager.py"
     tree = ast.parse(source.read_text())
     method = next(n for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "WebRTCManager"
                   for n in c.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "_create_voice_session")
-    # Annotation references a runtime class; test with our stub.
+    # Runtime annotations and the explicit missing-audio error are stubbed here.
+    env.setdefault("AudioDeviceUnavailableError", AudioDeviceUnavailableError)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])), str(source), "exec"), env)
     return env["_create_voice_session"]
 
@@ -42,6 +47,55 @@ def test_invalid_configuration_and_identity_loss_do_not_leave_capture_running():
     env["ice_server_settings"] = lambda: (_ for _ in ()).throw(ValueError("bad config"))
     with pytest.raises(ValueError): asyncio.run(create(manager, "peer", "call"))
     assert events == [] and not manager.audio_io._running
+
+
+def test_call_setup_fails_clearly_when_audio_start_returns_without_streams():
+    events = []
+
+    class Audio:
+        _running = False
+        def start(self): events.append("start")
+        def stop(self): events.append("stop")
+
+    manager = SimpleNamespace(
+        _voice_peers={}, audio_io=Audio(), input_device_index=None, output_device_index=None,
+        _on_peer_ice=None, _on_voice_state=None,
+        get_peer_public_key=lambda peer: "key",
+        _lifecycle=SimpleNamespace(matches=lambda *args: True),
+    )
+    env = {
+        "VoicePeerSession": object,
+        "ice_server_settings": lambda: [],
+        "asyncio": asyncio,
+        "logger": SimpleNamespace(info=lambda *args: None),
+        "AudioDeviceUnavailableError": AudioDeviceUnavailableError,
+    }
+    with pytest.raises(AudioDeviceUnavailableError):
+        asyncio.run(load_create(env)(manager, "peer", "call"))
+    assert events == ["start", "stop"]
+    assert not manager._voice_peers
+
+
+def test_audio_unavailable_state_warns_and_cleans_up_call_ui():
+    source = Path(__file__).resolve().parents[1] / "app/windows/main_screen.py"
+    tree = ast.parse(source.read_text())
+    method = next(
+        node for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == "MainScreen"
+        for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_update_rtc_state"
+    )
+    events = []
+    env = {
+        "QMessageBox": SimpleNamespace(warning=lambda *args: events.append(("warning", args[1], args[2]))),
+        "rtc": SimpleNamespace(end_call=lambda: events.append(("end_call",))),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])), str(source), "exec"), env)
+    screen = SimpleNamespace(
+        _active_call_device_id="peer-device",
+        _cleanup_call=lambda: events.append(("cleanup",)),
+    )
+    env["_update_rtc_state"](screen, "peer-device", "audio_unavailable")
+    assert [event[0] for event in events] == ["warning", "end_call", "cleanup"]
+    assert "микрофон" in events[0][2].lower()
 
 
 def test_session_creation_failure_closes_session_and_microphone():

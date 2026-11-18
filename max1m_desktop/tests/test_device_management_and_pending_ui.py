@@ -107,6 +107,8 @@ class _LabelStub:
         self._props = {}
         self._visible = False
         self._style = _StyleStub()
+        self._pixmap = None
+        self._accessible_name = ""
 
     def setText(self, t):
         self._text = t
@@ -116,6 +118,18 @@ class _LabelStub:
 
     def setToolTip(self, tip):
         self._tooltip = tip
+
+    def setPixmap(self, pixmap):
+        self._pixmap = pixmap
+
+    def pixmap(self):
+        return self._pixmap
+
+    def setAccessibleName(self, name):
+        self._accessible_name = name
+
+    def setFixedSize(self, *_):
+        pass
 
     def toolTip(self):
         return self._tooltip
@@ -169,7 +183,10 @@ class _FakeBubble:
         self.image_label = _LabelStub()
         self.caption_label = _LabelStub()
         if self.is_mine:
-            self.status_label = _LabelStub("✓✓" if self.is_read else "✓")
+            self._delivery_status = "read" if self.is_read else "sent"
+            self._delivery_tooltip = ""
+            self.status_label = _LabelStub()
+            self.status_label.setProperty("deliveryState", self._delivery_status)
             self.status_label.setProperty("read", self.is_read)
 
     def show_skeleton(self):
@@ -226,34 +243,49 @@ def _make_wav_bytes() -> bytes:
     return raw.getvalue()
 
 
-def test_message_bubble_status_pending_read_and_corrupt_image_methods():
-    # Verify __init__ AST no longer hardcodes QLabel("✓✓") unconditionally.
+def test_message_bubble_status_uses_theme_svg_icons_and_corrupt_image_text():
     mb_src = (DESKTOP_ROOT / "app/windows/widgets/message_bubble.py").read_text(encoding="utf-8")
-    assert 'QLabel("✓✓" if self.is_read else "✓")' in mb_src
+    assert '"status_pending.svg"' in mb_src
+    assert '"status_sent.svg"' in mb_src
+    assert '"status_read.svg"' in mb_src
 
     class _BadPixmap:
         def loadFromData(self, _b):
             return False
 
-    env = {"QPixmap": _BadPixmap, "Qt": SimpleNamespace(KeepAspectRatio=1, SmoothTransformation=1, transparent=0)}
+    class _IconStub:
+        def __init__(self, name, color, size): self.value = (name, color, size)
+        def pixmap(self, width, height): return self.value + (width, height)
+
+    env = {
+        "QPixmap": _BadPixmap,
+        "Qt": SimpleNamespace(KeepAspectRatio=1, SmoothTransformation=1, transparent=0),
+        "_render_svg": lambda name, color, size: _IconStub(name, color, size),
+    }
     methods = _extract_methods(
         "app/windows/widgets/message_bubble.py",
         "MessageBubble",
-        ["set_pending", "mark_as_read", "set_image"],
+        ["_set_delivery_status", "set_pending", "mark_as_read", "set_image"],
         env,
     )
+    _FakeBubble._set_delivery_status = methods["_set_delivery_status"]
+    _FakeBubble.set_pending = methods["set_pending"]
+    _FakeBubble.mark_as_read = methods["mark_as_read"]
 
     bubble = _FakeBubble("hello", is_mine=True, is_read=False)
-    assert bubble.status_label.text() == "✓"
-
+    assert bubble._delivery_status == "sent"
     methods["set_pending"](bubble)
-    assert bubble.status_label.text() == "⏳"
+    assert bubble._delivery_status == "pending"
+    assert bubble.status_label.property("deliveryState") == "pending"
     assert bubble.status_label.property("read") is False
+    assert bubble.status_label.pixmap()[0] == "status_pending.svg"
 
     methods["mark_as_read"](bubble)
     assert bubble.is_read is True
-    assert bubble.status_label.text() == "✓✓"
+    assert bubble._delivery_status == "read"
+    assert bubble.status_label.property("deliveryState") == "read"
     assert bubble.status_label.property("read") is True
+    assert bubble.status_label.pixmap()[0] == "status_read.svg"
 
     corrupt_img = _FakeBubble("", is_mine=False, is_read=True)
     corrupt_img.bubble = SimpleNamespace(setMaximumWidth=lambda _w: None)
@@ -358,9 +390,16 @@ def test_reopened_chat_restores_pending_clock_and_local_attachment_preview_and_v
     isolated_voice_cache = VoiceCache(tmp_path / "voice_cache")
 
     import math
+    class _IconStub:
+        def __init__(self, name, color, size): self.value = (name, color, size)
+        def pixmap(self, width, height): return self.value + (width, height)
     mb_methods = _extract_methods(
-        "app/windows/widgets/message_bubble.py", "MessageBubble", ["set_pending"], {}
+        "app/windows/widgets/message_bubble.py",
+        "MessageBubble",
+        ["_set_delivery_status", "set_pending"],
+        {"_render_svg": lambda name, color, size: _IconStub(name, color, size)},
     )
+    _FakeBubble._set_delivery_status = mb_methods["_set_delivery_status"]
     _FakeBubble.set_pending = mb_methods["set_pending"]
 
     network_downloads = []
@@ -424,7 +463,7 @@ def test_reopened_chat_restores_pending_clock_and_local_attachment_preview_and_v
     fake_screen._load_message_history("bob", messages)
 
     bubbles = [layout.itemAt(i).widget() for i in range(layout.count() - 1)]
-    assert [b.status_label.text() for b in bubbles] == ["⏳", "⏳", "⏳", "✓"]
+    assert [b._delivery_status for b in bubbles] == ["pending", "pending", "pending", "sent"]
     assert network_downloads == []
     assert bubbles[1].image_bytes == png_bytes
 

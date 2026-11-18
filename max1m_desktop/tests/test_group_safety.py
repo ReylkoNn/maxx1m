@@ -2,6 +2,8 @@ import ast
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from app.crypto_box import CryptoManager
+from app.group_crypto import group_crypto, store_member_sender_key
 from app.workers import FetchGroupsWorker, LeaveGroupWorker, DeleteGroupWorker
 
 class Response:
@@ -120,6 +122,121 @@ def test_group_list_callback_rejects_stale_account_and_starts_no_crypto_workers(
     screen._on_groups_fetched(True, data, worker)
     assert state.groups['g1']['my_sender_key'] is None
     assert state.groups['g1']['sender_keys'] == {}
+
+
+def test_group_member_roster_completion_recovers_sender_key_fetched_too_early():
+    alice = CryptoManager(); alice.generate_new_keypair()
+    bob = CryptoManager(); bob.generate_new_keypair()
+    alice_id, bob_id, group_id = 'alice-device', 'bob-device', 'g1'
+    alice_key = group_crypto.generate_sender_key(group_id='', epoch=1)
+    encrypted_key, signature = group_crypto.encrypt_sender_key_for_member(
+        alice_key, bob.get_public_key_b64(), group_id='',
+        sender_device_id=alice_id, recipient_device_id=bob_id,
+        crypto_mgr=alice,
+    )
+
+    state = SimpleNamespace(
+        username='bob', server_url='https://node', device_id=bob_id, token='t',
+        groups={group_id: {'members': [], 'sender_keys': {}, 'epoch': 1}},
+    )
+    events = ['initial_sender_key_fetch']  # Started concurrently by group_created.
+    env = {
+        'state': state,
+        'group_crypto': SimpleNamespace(
+            decrypt_sender_key=lambda *args, **kwargs: group_crypto.decrypt_sender_key(
+                *args, crypto_mgr=bob, **kwargs
+            )
+        ),
+        'store_member_sender_key': store_member_sender_key,
+    }
+    names = ['ingest_sender_key_entry', '_on_group_members_loaded']
+    ingest, on_members_loaded = extract(names, env)
+    members = [{'device_id': alice_id, 'public_key': alice.get_public_key_b64(),
+                'device_name': 'Alice'}]
+    worker = SimpleNamespace(
+        account_context=('bob', 'https://node', bob_id, 't'),
+        _force_rotate=False, _target_epoch=1,
+    )
+
+    class Screen:
+        ingest_sender_key_entry = ingest
+        _on_group_members_loaded = on_members_loaded
+        def __init__(self): self._net_workers = [worker]
+        def _resolve_group_member_pub_and_name(self, gid, sender_id):
+            for member in state.groups[gid]['members']:
+                if member.get('device_id') == sender_id:
+                    return member.get('public_key'), member.get('device_name', '')
+            return None, ''
+        def _save_group_keys_safe(self): pass
+        def ensure_my_group_sender_key(self, gid, **_kwargs):
+            assert state.groups[gid]['members'] is members
+            assert alice_id in state.groups[gid]['sender_keys']
+            events.append('ensure_own_key')
+        def _request_group_sender_keys(self, gid):
+            assert state.groups[gid]['members'] is members
+            events.append('retry_sender_key_fetch_with_roster')
+        def _drain_deferred_group_messages(self, _gid): events.append('drain_deferred')
+
+    screen = Screen()
+    # This is the reproducible bad order: SenderKey response arrives before
+    # FetchGroupMembers, so its authenticated sender key cannot be resolved.
+    assert not screen.ingest_sender_key_entry(
+        group_id, alice_id, encrypted_key, signature, epoch=1
+    )
+    assert not state.groups[group_id]['sender_keys']
+
+    # group_created also carries the same encrypted key inline. It is held until
+    # the authoritative member response makes signature verification possible.
+    screen._pending_group_sender_keys = {
+        (state.username, state.server_url, state.device_id, group_id): [{
+            'sender_device_id': alice_id,
+            'encrypted_sender_key': encrypted_key,
+            'sender_key_signature': signature,
+            'epoch': 1,
+        }]
+    }
+    screen._on_group_members_loaded(True, members, group_id, worker)
+    assert events == [
+        'initial_sender_key_fetch', 'drain_deferred', 'ensure_own_key',
+        'retry_sender_key_fetch_with_roster', 'drain_deferred',
+    ]
+    assert alice_id in state.groups[group_id]['sender_keys']
+
+
+def test_group_created_event_queues_inline_sender_key_until_roster_is_loaded():
+    state = SimpleNamespace(
+        username='bob', server_url='https://node', device_id='bob-device', groups={}
+    )
+    method = extract(
+        ['process_group_created_event'],
+        {'state': state, 'SERVER_GROUP_NAME_PLACEHOLDER': '[E2EE]'},
+    )[0]
+    calls = []
+    screen = SimpleNamespace(
+        _get_group_item=lambda _gid: None,
+        _add_group_card=lambda *args: calls.append(('card', args)),
+        _persist_groups_index=lambda: None,
+        _fetch_group_members_and_rotate=lambda gid, **kwargs: calls.append(('members', gid, kwargs)),
+        _request_group_sender_keys=lambda gid: calls.append(('keys', gid)),
+    )
+    entry = {
+        'encrypted_sender_key': 'opaque-encrypted-key',
+        'sender_key_signature': 'signature',
+        'epoch': 1,
+    }
+    method(screen, {
+        'group_id': 'g1', 'group_name': '[E2EE]', 'epoch': 1,
+        'created_by': 'alice-device', 'sender_key_from': 'alice-device',
+        'sender_key': entry,
+    })
+    assert screen._pending_group_sender_keys[('bob', 'https://node', 'bob-device', 'g1')] == [{
+        'sender_device_id': 'alice-device',
+        'encrypted_sender_key': 'opaque-encrypted-key',
+        'sender_key_signature': 'signature',
+        'epoch': 1,
+    }]
+    assert ('members', 'g1', {'target_epoch': 1}) in calls
+    assert ('keys', 'g1') in calls
 
 
 def test_delete_group_confirmation_does_not_target_switched_group():

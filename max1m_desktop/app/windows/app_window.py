@@ -1326,7 +1326,7 @@ class AppWindow(QMainWindow):
 
     def _setup_size_grip(self):
         self.grip_container = QFrame(self.root_frame)
-        self.grip_container.setStyleSheet("background: transparent;")
+        self.grip_container.setObjectName("SizeGripContainer")
         grip_layout = QVBoxLayout(self.grip_container)
         grip_layout.setContentsMargins(0, 0, 0, 0)
         self.size_grip = QSizeGrip(self.grip_container)
@@ -2153,7 +2153,7 @@ class AppWindow(QMainWindow):
         mask_fn = getattr(storage, "should_mask_notifications", None)
         masked = bool(mask_fn(getattr(state, "username", ""))) if callable(mask_fn) else False
         if masked:
-            self.in_app_toast.show_notification("Max1m", "🔒 Новое зашифрованное сообщение", is_group=False)
+            self.in_app_toast.show_notification("Max1m", "Новое зашифрованное сообщение", is_group=False)
             return
         self.in_app_toast.show_notification(title, message, is_group=is_group)
 

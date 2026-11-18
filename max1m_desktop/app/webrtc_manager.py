@@ -96,6 +96,10 @@ CALL_STATE_CONNECTED = "connected"
 CALL_STATE_ENDED = "ended"
 
 
+class AudioDeviceUnavailableError(RuntimeError):
+    """Raised when a voice call cannot open its local microphone/speaker streams."""
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SIGNAL CRYPTO — E2EE for SDP / ICE / screen control
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1064,8 +1068,12 @@ class WebRTCManager:
             try:
                 self.audio_io.start()
                 started_here = True
+                if not getattr(self.audio_io, "_running", False):
+                    raise AudioDeviceUnavailableError(
+                        "Не удалось открыть микрофон и динамики. Проверьте устройства в настройках."
+                    )
             except BaseException:
-                if self.audio_io._running:
+                if self.audio_io._running or started_here:
                     self.audio_io.stop()
                 raise
             await asyncio.sleep(0.05)
@@ -1168,9 +1176,14 @@ class WebRTCManager:
                 await session.close()
             if not self._voice_peers and self.audio_io._running:
                 self.audio_io.stop()
-            logger.error("Voice offer failed [%s]: %s", to_device_id[:8], e)
+            logger.error("Voice offer failed [%s]: %s", to_device_id[:8], type(e).__name__)
             if self._lifecycle.matches(to_device_id, call_id):
-                self._emit_state(to_device_id, call_id, "failed")
+                self.call_state = CALL_STATE_IDLE
+                self._emit_state(
+                    to_device_id,
+                    call_id,
+                    "audio_unavailable" if isinstance(e, AudioDeviceUnavailableError) else "failed",
+                )
 
     async def _handle_voice_offer(self, from_id: str, call_id: str, sdp: str):
         session = None
@@ -1204,9 +1217,14 @@ class WebRTCManager:
                 await session.close()
             if not self._voice_peers and self.audio_io._running:
                 self.audio_io.stop()
-            logger.error("Handle voice offer failed [%s]: %s", from_id[:8], e)
+            logger.error("Handle voice offer failed [%s]: %s", from_id[:8], type(e).__name__)
             if self._lifecycle.matches(from_id, call_id):
-                self._emit_state(from_id, call_id, "failed")
+                self.call_state = CALL_STATE_IDLE
+                self._emit_state(
+                    from_id,
+                    call_id,
+                    "audio_unavailable" if isinstance(e, AudioDeviceUnavailableError) else "failed",
+                )
 
     async def _handle_voice_answer(self, from_id: str, call_id: str, sdp: str):
         async with self._voice_gate:

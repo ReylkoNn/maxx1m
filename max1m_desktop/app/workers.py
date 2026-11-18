@@ -518,7 +518,7 @@ class WebSocketWorker(QThread):
                     self._ws = ws
                     backoff = 1.0
                     self.connection_status.emit("connected")
-                    print("[WS] ✅ Подключено")  # Never log the token-bearing URL.
+                    print("[WS] Подключено")  # Never log the token-bearing URL.
 
                     event_signals = {
                         "new_message": self.new_message_received,
@@ -1328,4 +1328,3 @@ class UploadAndGrantGroupAttachmentWorker(QThread):
         finally:
             self.token = ""
             self.encrypted_blob = b""
-

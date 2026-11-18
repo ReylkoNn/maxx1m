@@ -138,17 +138,13 @@ $env:PYTHONIOENCODING = "utf-8"
 $env:MAX1M_SHORT_BUILD_ROOT = $ShortRoot
 
 Write-Host "[3/4] Installing desktop wheels and PyInstaller (pyinstaller==6.22.3) ..." -ForegroundColor Cyan
-& $PyExe -m pip install --upgrade pip wheel
+& $PyExe -m pip install --upgrade --only-binary=:all: pip wheel
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 & $PyExe -m pip install --only-binary=:all: -r (Join-Path $RepoRoot "max1m_desktop\requirements.txt") pyinstaller==6.22.3
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[WARN] Retrying pip install without strict binary-only flag ..." -ForegroundColor Yellow
-    & $PyExe -m pip install -r (Join-Path $RepoRoot "max1m_desktop\requirements.txt") pyinstaller==6.22.3
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[ERROR] pip install failed." -ForegroundColor Red
-        exit $LASTEXITCODE
-    }
+    Write-Host "[ERROR] A required Windows wheel is unavailable for Python $TargetVer. No source-build fallback is permitted." -ForegroundColor Red
+    exit $LASTEXITCODE
 }
 
 Write-Host "[4/4] Building portable Max1m.exe bundle ..." -ForegroundColor Cyan

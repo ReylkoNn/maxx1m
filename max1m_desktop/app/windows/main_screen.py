@@ -640,6 +640,7 @@ class MainScreen(QFrame):
     _voice_recording_limit     = Signal(int)
     _group_voice_speaking_sig  = Signal(str, bool)
     _group_voice_screen_sig    = Signal(str, object, str)
+    _group_voice_error_sig     = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -1142,7 +1143,6 @@ class MainScreen(QFrame):
         # ── Animated background widget inside chat_area ──
         self._bg_frame = QFrame(self.chat_area)
         self._bg_frame.setObjectName("AnimatedBgFrame")
-        self._bg_frame.setStyleSheet("background: transparent;")
         self._bg_particles = []
         self._bg_waves = []
         self._bg_tick_count = 0
@@ -1699,7 +1699,7 @@ class MainScreen(QFrame):
             if is_new:
                 card = self._get_ally_card(sender_username)
                 if card:
-                    card.update_preview(f"📄 {safe_fname}")
+                    card.update_preview(f"Документ: {safe_fname}")
                 ally_item = self._get_ally_item(sender_username)
                 if ally_item:
                     import time as _time
@@ -1728,7 +1728,7 @@ class MainScreen(QFrame):
                 if should_notify:
                     main_window = self.window()
                     if hasattr(main_window, "show_notification"):
-                        main_window.show_notification(f"@{sender_username}", f"📄 {safe_fname}")
+                        main_window.show_notification(f"@{sender_username}", f"Документ: {safe_fname}")
 
         if msg_type in {"text", "image", "voice", "file"} and is_new and is_chat_open:
             if show_live:
@@ -3089,11 +3089,28 @@ class MainScreen(QFrame):
         if not success or not isinstance(members, list) or group_id not in state.groups:
             return
         state.groups[group_id]["members"] = members
+        pending_map = getattr(self, "_pending_group_sender_keys", None)
+        pending_key = (state.username, state.server_url, state.device_id, group_id)
+        pending_entries = list(pending_map.pop(pending_key, [])) if isinstance(pending_map, dict) else []
+        for entry in pending_entries:
+            self.ingest_sender_key_entry(
+                group_id,
+                entry["sender_device_id"],
+                entry["encrypted_sender_key"],
+                entry["sender_key_signature"],
+                epoch=entry["epoch"],
+            )
         self.ensure_my_group_sender_key(
             group_id,
             force_rotate=bool(getattr(worker, "_force_rotate", False)),
             target_epoch=getattr(worker, "_target_epoch", None),
         )
+        # Group-created/key-update handlers can fetch the roster and SenderKeys
+        # concurrently. If the key response arrived first, validation failed
+        # because this authoritative roster had no sender public key yet. Retry
+        # now that the member keys are available, then drain any waiting messages
+        # when the refreshed SenderKeys arrive.
+        self._request_group_sender_keys(group_id)
         self._drain_deferred_group_messages(group_id)
 
     def _on_group_key_distributed(self, success: bool, data, group_id: str, worker):
@@ -3335,8 +3352,7 @@ class MainScreen(QFrame):
                 bubble = MessageBubble("", is_mine=True, is_read=False,
                                        voice_data=raw_data, voice_duration=duration)
             bubble.msg_id = msg_id
-            bubble.status_label.setText("⏳")
-            bubble.status_label.setToolTip("В очереди: загрузка и отправка ещё не подтверждены")
+            bubble.set_pending("В очереди: загрузка и отправка ещё не подтверждены")
             self._connect_bubble_signals(bubble, context.owner_username)
             self.messages_layout.insertWidget(self.messages_layout.count() - 1, bubble)
             QTimer.singleShot(50, lambda: self.messages_scroll.verticalScrollBar().setValue(
@@ -3346,7 +3362,7 @@ class MainScreen(QFrame):
         card = self._get_ally_card(context.username)
         if card:
             if kind == "file":
-                card.update_preview(f"📄 {safe_doc_name}")
+                card.update_preview(f"Документ: {safe_doc_name}")
             else:
                 card.update_preview("Фото" if kind == "image" else "Голосовое")
         self._try_attachment_outbox()
@@ -3568,7 +3584,7 @@ class MainScreen(QFrame):
                 self.messages_scroll.verticalScrollBar().maximum()
             ))
         except Exception:
-            worker.bubble.msg_label.setText("❌ Ошибка расшифровки")
+            worker.bubble.msg_label.setText("Ошибка расшифровки")
             worker.bubble.msg_label.setVisible(True)
 
     def _send_system_payload(self, receiver_username: str, payload_dict: dict,
@@ -3819,7 +3835,7 @@ class MainScreen(QFrame):
             self._net_workers.remove(worker)
 
         if not success:
-            print(f"[SEND] ❌ Ошибка отправки ({msg_type}): {data}")
+            print(f"[SEND] Ошибка отправки ({msg_type}): {data}")
             if msg_type in {"text", "image", "voice"}:
                 QMessageBox.warning(
                     self, "Отправка не подтверждена",
@@ -3921,8 +3937,8 @@ class MainScreen(QFrame):
                     for i in range(self.messages_layout.count()):
                         bubble = self.messages_layout.itemAt(i).widget()
                         if getattr(bubble, "msg_id", None) == history.get("msg_id") and hasattr(bubble, "status_label"):
-                            bubble.status_label.setText("✓✓" if bubble.is_read else "✓")
-                            bubble.status_label.setToolTip("Сервер принял сообщение; это не подтверждение прочтения")
+                            if hasattr(bubble, "mark_as_sent"):
+                                bubble.mark_as_sent("Сервер принял сообщение; это не подтверждение прочтения")
                             break
             except Exception as e:
                 print(f"[OUTBOX] Не удалось подтвердить локальную очередь: {type(e).__name__}")
@@ -3957,6 +3973,13 @@ class MainScreen(QFrame):
             btn = getattr(self, btn_name, None)
             if btn:
                 btn.refresh_theme()
+        if hasattr(self, "pinned_banner"):
+            self._refresh_pinned_banner()
+        if hasattr(self, "group_voice_bar"):
+            self.gv_status_icon.setPixmap(
+                _render_svg_icon("headset_on.svg", get_theme().get("accent", "#6c748a"), 16).pixmap(16, 16)
+            )
+            self._refresh_group_voice_bar()
 
     def open_settings(self):
         if self.settings_screen is None:
@@ -3967,6 +3990,8 @@ class MainScreen(QFrame):
                 self.settings_screen.logout_requested.connect(self.logout_requested.emit)
             if hasattr(self.settings_screen, "call_audio_prefs_changed"):
                 self.settings_screen.call_audio_prefs_changed.connect(self.on_call_audio_prefs_changed)
+            if hasattr(self.settings_screen, "audio_devices_changed"):
+                self.settings_screen.audio_devices_changed.connect(self.on_audio_devices_changed)
             self.right_stack.addWidget(self.settings_screen)
         if hasattr(self.settings_screen, "refresh"):
             self.settings_screen.refresh()
@@ -4325,8 +4350,9 @@ class MainScreen(QFrame):
                 ("24 часа", 86400),
                 ("7 дней", 604800),
             ):
-                prefix = "✓ " if cur_ttl == sec_val else "   "
-                act_ttl = ttl_menu.addAction(f"{prefix}{label_txt}")
+                act_ttl = ttl_menu.addAction(label_txt)
+                act_ttl.setCheckable(True)
+                act_ttl.setChecked(cur_ttl == sec_val)
                 act_ttl.triggered.connect(
                     lambda _checked=False, ck=chat_key, sv=sec_val: self._set_current_chat_ttl(ck, sv)
                 )
@@ -4924,11 +4950,30 @@ class MainScreen(QFrame):
         if self._voice_thread and self._voice_thread.is_alive():
             QMessageBox.warning(self, "Микрофон ещё закрывается", "Дождитесь остановки предыдущей записи и попробуйте снова.")
             return
-        try:
-            self._voice_recipient_context = capture_recipient(state)
-        except ValueError as e:
-            QMessageBox.warning(self, "Запись недоступна", str(e))
-            return
+
+        if getattr(state, "current_chat_type", "ally") == "group":
+            group_id = getattr(state, "current_group_id", None)
+            group = (getattr(state, "groups", {}) or {}).get(group_id)
+            if (
+                not GROUP_CHAT_SEND_ENABLED
+                or not group_id
+                or not isinstance(group, dict)
+                or group.get("archived")
+            ):
+                QMessageBox.warning(self, "Запись недоступна", "Нельзя записать голосовое сообщение в эту группу.")
+                return
+            # Keep the destination pinned while the mic thread is running. A chat
+            # switch before release must never redirect the recording elsewhere.
+            self._voice_recipient_context = ("group", group_id)
+        else:
+            try:
+                self._voice_recipient_context = capture_recipient(state)
+            except ValueError as e:
+                QMessageBox.warning(self, "Запись недоступна", str(e))
+                return
+        self._voice_account_context = (
+            state.username, state.server_url, state.device_id, state.token
+        )
         self._is_recording  = True
         self._voice_cancelled = False
         self._voice_frames  = []
@@ -4949,9 +4994,11 @@ class MainScreen(QFrame):
         max_bytes = 120 * 16000 * 2  # Two minutes of 16-bit mono PCM.
         try:
             pa = pyaudio.PyAudio()
+            input_device_index = getattr(rtc, "input_device_index", None)
             self._voice_stream = pa.open(
                 format=pyaudio.paInt16, channels=1, rate=16000,
-                input=True, frames_per_buffer=1024,
+                input=True, input_device_index=input_device_index,
+                frames_per_buffer=1024,
             )
             while self._is_recording:
                 data = self._voice_stream.read(1024, exception_on_overflow=False)
@@ -5016,6 +5063,21 @@ class MainScreen(QFrame):
         duration = sum(map(len, self._voice_frames)) / (16000 * 2)
         self._voice_frames = []
         context = getattr(self, "_voice_recipient_context", None)
+        if isinstance(context, tuple) and len(context) == 2 and context[0] == "group":
+            group_id = context[1]
+            group = (getattr(state, "groups", {}) or {}).get(group_id)
+            if (
+                getattr(self, "_voice_account_context", None)
+                != (state.username, state.server_url, state.device_id, state.token)
+                or getattr(state, "current_chat_type", "ally") != "group"
+                or getattr(state, "current_group_id", None) != group_id
+                or not isinstance(group, dict)
+                or group.get("archived")
+            ):
+                QMessageBox.warning(self, "Отправка отменена", "Группа или учётная запись изменилась во время записи.")
+                return
+            self._send_group_attachment(group_id, voice_data, "voice", duration=duration)
+            return
         if not context or not is_active_recipient(state, context):
             QMessageBox.warning(self, "Отправка отменена", "Чат или ключ контакта изменился во время записи.")
             return
@@ -5746,6 +5808,66 @@ class MainScreen(QFrame):
                 state.groups[group_id]["name"] = group_name
             state.groups[group_id]["epoch"] = max(int(state.groups[group_id].get("epoch", 1) or 1), epoch)
 
+        # Preserve inline SenderKeys from group_created/group_invited events until
+        # the authoritative roster supplies the sender public keys needed to verify them.
+        pending_map = getattr(self, "_pending_group_sender_keys", None)
+        if not isinstance(pending_map, dict):
+            self._pending_group_sender_keys = pending_map = {}
+        account_key = (state.username, state.server_url, state.device_id)
+        for stale_key in list(pending_map):
+            if not isinstance(stale_key, tuple) or stale_key[:3] != account_key:
+                pending_map.pop(stale_key, None)
+        pending_key = (*account_key, group_id)
+        bucket = pending_map.setdefault(pending_key, [])
+        total_pending = sum(len(entries) for entries in pending_map.values() if isinstance(entries, list))
+        inline_entries = []
+        inline_key = data.get("sender_key")
+        if isinstance(inline_key, dict):
+            inline_entries.append({
+                **inline_key,
+                "sender_device_id": inline_key.get("sender_device_id") or data.get("sender_key_from") or created_by,
+            })
+        raw_entries = data.get("sender_keys")
+        if isinstance(raw_entries, list):
+            inline_entries.extend(entry for entry in raw_entries if isinstance(entry, dict))
+        for entry in inline_entries:
+            sender_id = entry.get("sender_device_id") or data.get("sender_key_from") or created_by
+            encrypted = entry.get("encrypted_sender_key")
+            signature = entry.get("sender_key_signature")
+            raw_entry_epoch = entry.get("epoch", epoch)
+            if isinstance(raw_entry_epoch, bool):
+                continue
+            try:
+                entry_epoch = int(raw_entry_epoch or epoch)
+            except (TypeError, ValueError):
+                continue
+            if (
+                not isinstance(sender_id, str) or not 1 <= len(sender_id) <= 128
+                or not isinstance(encrypted, str) or not 1 <= len(encrypted) <= 16 * 1024
+                or not isinstance(signature, str) or not 1 <= len(signature) <= 512
+                or not 1 <= entry_epoch <= 2**31 - 1
+            ):
+                continue
+            normalized = {
+                "sender_device_id": sender_id,
+                "encrypted_sender_key": encrypted,
+                "sender_key_signature": signature,
+                "epoch": entry_epoch,
+            }
+            if (
+                len(bucket) < 64
+                and total_pending < 256
+                and not any(
+                    item.get("sender_device_id") == sender_id
+                    and item.get("encrypted_sender_key") == encrypted
+                    for item in bucket
+                )
+            ):
+                bucket.append(normalized)
+                total_pending += 1
+        if not bucket:
+            pending_map.pop(pending_key, None)
+
         if not self._get_group_item(group_id):
             self._add_group_card(group_id, group_name)
         self._persist_groups_index()
@@ -6388,6 +6510,14 @@ class MainScreen(QFrame):
         if actual == "connected":
             self._cw_status.setText("На связи")
             self._cs_screen_btn.setVisible(True)
+        elif actual == "audio_unavailable":
+            QMessageBox.warning(
+                self,
+                "Аудиоустройство недоступно",
+                "Не удалось открыть микрофон и динамики. Проверьте выбранные устройства в настройках и попробуйте снова.",
+            )
+            rtc.end_call()
+            self._cleanup_call()
         elif actual in ("failed", "closed", "disconnected"):
             rtc.end_call()
             self._cleanup_call()
@@ -6407,13 +6537,15 @@ class MainScreen(QFrame):
 
     def _show_screen_quality_menu(self, pos):
         menu = QMenu(self)
+        menu.setObjectName("ChatContextMenu")
         for q_key, q_label in (
             ("smooth", "Плавное • 540p 30 FPS"),
             ("balanced", "Баланс • 720p 24 FPS"),
             ("sharp", "Чёткое • 900p 20 FPS"),
         ):
-            prefix = "✓ " if self.current_quality_profile == q_key else "   "
-            act = menu.addAction(prefix + q_label)
+            act = menu.addAction(q_label)
+            act.setCheckable(True)
+            act.setChecked(self.current_quality_profile == q_key)
             act.triggered.connect(lambda _checked=False, k=q_key: self._set_screen_share_quality(k))
         menu.exec(self._cs_screen_btn.mapToGlobal(pos))
 
@@ -6660,9 +6792,11 @@ class MainScreen(QFrame):
             on_participants_updated=None,
             on_speaking_updated=lambda dev_id, spk: self._group_voice_speaking_sig.emit(dev_id, spk),
             on_screen_frame=lambda pid, rgb, res: self._group_voice_screen_sig.emit(pid, rgb, res),
+            on_error=lambda message: self._group_voice_error_sig.emit(str(message)),
         )
         self._group_voice_speaking_sig.connect(self._on_group_voice_speaking_gui, Qt.QueuedConnection)
         self._group_voice_screen_sig.connect(self._on_group_voice_screen_gui, Qt.QueuedConnection)
+        self._group_voice_error_sig.connect(self._show_group_voice_error, Qt.QueuedConnection)
 
         self.group_voice_bar = QFrame()
         self.group_voice_bar.setObjectName("SearchBar")
@@ -6673,32 +6807,52 @@ class MainScreen(QFrame):
 
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
+        self.gv_status_icon = QLabel()
+        self.gv_status_icon.setObjectName("GroupVoiceStatusIcon")
+        self.gv_status_icon.setFixedSize(16, 16)
+        self.gv_status_icon.setFocusPolicy(Qt.NoFocus)
+        self.gv_status_icon.setPixmap(
+            _render_svg_icon("headset_on.svg", get_theme().get("accent", "#6c748a"), 16).pixmap(16, 16)
+        )
+        top_row.addWidget(self.gv_status_icon)
         self.gv_status_lbl = QLabel("Голосовая комната")
         self.gv_status_lbl.setObjectName("ReplyPreviewSender")
         top_row.addWidget(self.gv_status_lbl)
         top_row.addStretch()
 
         self.gv_join_btn = QPushButton("Войти в голос")
+        self.gv_join_btn.setObjectName("GroupVoiceJoinButton")
+        self.gv_join_btn.setFocusPolicy(Qt.NoFocus)
         self.gv_join_btn.clicked.connect(self.join_current_group_voice_room)
         top_row.addWidget(self.gv_join_btn)
 
         self.gv_mic_btn = QPushButton("Микрофон: ВКЛ")
+        self.gv_mic_btn.setObjectName("GroupVoiceControlButton")
+        self.gv_mic_btn.setFocusPolicy(Qt.NoFocus)
         self.gv_mic_btn.clicked.connect(self._toggle_gv_mic)
         top_row.addWidget(self.gv_mic_btn)
 
         self.gv_deaf_btn = QPushButton("Звук: ВКЛ")
+        self.gv_deaf_btn.setObjectName("GroupVoiceControlButton")
+        self.gv_deaf_btn.setFocusPolicy(Qt.NoFocus)
         self.gv_deaf_btn.clicked.connect(self._toggle_gv_deafen)
         top_row.addWidget(self.gv_deaf_btn)
 
         self.gv_ptt_btn = QPushButton("Рация (V): ВЫКЛ")
+        self.gv_ptt_btn.setObjectName("GroupVoiceControlButton")
+        self.gv_ptt_btn.setFocusPolicy(Qt.NoFocus)
         self.gv_ptt_btn.clicked.connect(self._toggle_gv_ptt)
         top_row.addWidget(self.gv_ptt_btn)
 
         self.gv_screen_btn = QPushButton("Экран")
+        self.gv_screen_btn.setObjectName("GroupVoiceControlButton")
+        self.gv_screen_btn.setFocusPolicy(Qt.NoFocus)
         self.gv_screen_btn.clicked.connect(self._toggle_gv_screen_share)
         top_row.addWidget(self.gv_screen_btn)
 
         self.gv_leave_btn = QPushButton("Выйти")
+        self.gv_leave_btn.setObjectName("GroupVoiceLeaveButton")
+        self.gv_leave_btn.setFocusPolicy(Qt.NoFocus)
         self.gv_leave_btn.clicked.connect(self.leave_group_voice_room)
         top_row.addWidget(self.gv_leave_btn)
 
@@ -6750,6 +6904,11 @@ class MainScreen(QFrame):
             self._group_voice_ctrl.apply_audio_prefs(prefs)
             self._refresh_group_voice_bar()
 
+    def on_audio_devices_changed(self, input_device_index, output_device_index):
+        gvc = getattr(self, "_group_voice_ctrl", None)
+        if gvc is not None:
+            gvc.set_audio_devices(input_device_index, output_device_index)
+
     def _on_toggle_group_voice_btn(self):
         gvc = getattr(self, "_group_voice_ctrl", None)
         gid = state.current_group_id
@@ -6800,6 +6959,8 @@ class MainScreen(QFrame):
                     our_username=state.username,
                     initial_participants=participants,
                     audio_prefs=prefs,
+                    input_device_index=getattr(rtc, "input_device_index", None),
+                    output_device_index=getattr(rtc, "output_device_index", None),
                 )
             elif self._group_voice_ctrl.active_group_id == group_id:
                 self._group_voice_ctrl.update_participants(group_id, participants)
@@ -6916,6 +7077,10 @@ class MainScreen(QFrame):
         if isinstance(data, dict) and hasattr(self, "_group_voice_ctrl"):
             self._group_voice_ctrl.handle_incoming_signal(data)
 
+    def _show_group_voice_error(self, message: str):
+        if message:
+            QMessageBox.warning(self, "Голосовая комната", str(message)[:512])
+
     def _on_group_voice_speaking_gui(self, device_id: str, is_speaking: bool):
         self._group_voice_speaking[device_id] = bool(is_speaking)
         self._refresh_group_voice_bar()
@@ -6983,8 +7148,8 @@ class MainScreen(QFrame):
 
         if in_room:
             from app.ice_config import ice_relay_only
-            relay_badge = " • IP скрыт (TURN)" if ice_relay_only() else ""
-            self.gv_status_lbl.setText(f"🔊 В голосовой комнате «{grp_name}» ({len(roster)}/8){relay_badge}")
+            relay_badge = " — IP скрыт (TURN)" if ice_relay_only() else ""
+            self.gv_status_lbl.setText(f"В голосовой комнате «{grp_name}» ({len(roster)}/8){relay_badge}")
         else:
             self.gv_status_lbl.setText(
                 f"Голосовая комната «{grp_name}» — участников: {len(roster)}/8"
@@ -7009,21 +7174,57 @@ class MainScreen(QFrame):
             dev_id = p.get("device_id", "")
             uname = p.get("username", "user")
             speaking = bool(self._group_voice_speaking.get(dev_id, False))
-            ring = "🟢 " if speaking else "⚪ "
-            mute_tag = " 🔇" if p.get("is_muted") else ""
-            scr_tag = " 🖥" if p.get("is_sharing_screen") else ""
-            chip = QPushButton(f"{ring}@{uname}{mute_tag}{scr_tag}")
+            peer_muted = bool(p.get("is_muted"))
+            peer_sharing = bool(p.get("is_sharing_screen"))
+            theme = get_theme()
+            dot_color = theme.get("success", "#54caa0") if speaking else theme.get("text_dim", "#777e8e")
+            chip = QPushButton(f"@{uname}")
+            chip.setObjectName("GroupVoicePeerButton")
             chip.setFocusPolicy(Qt.NoFocus)
+            chip.setIcon(_render_svg_icon("dot_connected.svg", dot_color, 12))
+            chip.setIconSize(QSize(12, 12))
+            chip.setProperty("speaking", "true" if speaking else "false")
+            tip_parts = []
+            if speaking:
+                tip_parts.append("Говорит сейчас")
+            if peer_muted:
+                tip_parts.append("Микрофон выключен")
+            if peer_sharing:
+                tip_parts.append("Демонстрация экрана активна")
             if in_room and dev_id != state.device_id:
                 vol_pct = int(round(gvc.mixer.get_peer_volume(dev_id) * 100))
-                chip.setToolTip(f"Нажмите для настройки громкости @{uname} ({vol_pct}%)")
+                tip_parts.append(f"Громкость: {vol_pct}%. Нажмите для настройки")
                 chip.clicked.connect(
                     lambda _checked=False, d=dev_id, u=uname, b=chip: self._open_peer_volume_menu(d, u, b)
                 )
+            chip.setToolTip("\n".join(tip_parts) if tip_parts else "Участник голосовой комнаты")
             self.gv_peers_row.addWidget(chip)
 
-            if in_room and dev_id != state.device_id and p.get("is_sharing_screen"):
+            if peer_muted:
+                mute_icon = QLabel()
+                mute_icon.setObjectName("GroupVoiceStatusIcon")
+                mute_icon.setFixedSize(14, 14)
+                mute_icon.setFocusPolicy(Qt.NoFocus)
+                mute_icon.setPixmap(
+                    _render_svg_icon("mic_off.svg", theme.get("danger", "#ff7b8d"), 14).pixmap(14, 14)
+                )
+                mute_icon.setToolTip("Микрофон выключен")
+                self.gv_peers_row.addWidget(mute_icon)
+
+            if peer_sharing:
+                share_icon = QLabel()
+                share_icon.setObjectName("GroupVoiceStatusIcon")
+                share_icon.setFixedSize(14, 14)
+                share_icon.setFocusPolicy(Qt.NoFocus)
+                share_icon.setPixmap(
+                    _render_svg_icon("screen_share.svg", theme.get("accent", "#6c748a"), 14).pixmap(14, 14)
+                )
+                share_icon.setToolTip("Демонстрация экрана активна")
+                self.gv_peers_row.addWidget(share_icon)
+
+            if in_room and dev_id != state.device_id and peer_sharing:
                 watch_btn = QPushButton("Смотреть стрим")
+                watch_btn.setObjectName("GroupVoiceControlButton")
                 watch_btn.setFocusPolicy(Qt.NoFocus)
                 watch_btn.clicked.connect(lambda _c=False, d=dev_id: gvc.watch_peer_screen(d))
                 self.gv_peers_row.addWidget(watch_btn)
@@ -7256,7 +7457,7 @@ class MainScreen(QFrame):
                 card.update_preview("Голосовое")
             elif special_text.startswith("[FILE_META]|"):
                 _fp = special_text.split("|", 5)
-                card.update_preview(f"📄 {_fp[3]}" if len(_fp) >= 4 else "Документ")
+                card.update_preview(f"Документ: {_fp[3]}" if len(_fp) >= 4 else "Документ")
         if state.current_chat_type == "group" and state.current_group_id == group_id:
             self._render_history_page()
 
@@ -7431,7 +7632,7 @@ class MainScreen(QFrame):
             if uname and uname in state.allies:
                 ctx = RecipientContext(uname, dev_id, pub, account[0], account[1], account[2])
                 is_ver = recipient_is_verified(state, ctx)
-            badge = "✓ Проверен" if is_ver else "⚠ Не проверен"
+            badge = "Проверен" if is_ver else "Не проверен"
             title = f"@{uname}" if uname else f"Устройство {dev_id[:8]}"
             candidates.append((f"{title} ({dev_name}) — {badge}", uname, dev_id, dev_name, pub, is_ver, m.get("user_id")))
 
@@ -7514,15 +7715,17 @@ class MainScreen(QFrame):
         lay.setContentsMargins(24, 4, 24, 4)
         lay.setSpacing(10)
 
-        self.pinned_jump_btn = QPushButton("📌 Закреплено")
+        self.pinned_jump_btn = QPushButton("Закреплено")
+        self.pinned_jump_btn.setObjectName("PinnedJumpButton")
         self.pinned_jump_btn.setFlat(True)
         self.pinned_jump_btn.setCursor(Qt.PointingHandCursor)
-        self.pinned_jump_btn.setStyleSheet("text-align: left; font-weight: 600;")
+        self.pinned_jump_btn.setIconSize(QSize(14, 14))
         self.pinned_jump_btn.clicked.connect(self._on_pinned_banner_clicked)
 
-        self.pinned_unpin_btn = QPushButton("✕")
-        self.pinned_unpin_btn.setFixedSize(26, 26)
-        self.pinned_unpin_btn.setCursor(Qt.PointingHandCursor)
+        self.pinned_unpin_btn = ThemedIconButton(
+            str(ICONS_PATH / "close_small.svg"), 26, 12
+        )
+        self.pinned_unpin_btn.setObjectName("PinnedUnpinButton")
         self.pinned_unpin_btn.setToolTip("Открепить сообщение")
         self.pinned_unpin_btn.clicked.connect(self._unpin_current_chat_message)
 
@@ -7541,7 +7744,11 @@ class MainScreen(QFrame):
             prev = (pin_info.get("preview") or "Сообщение").replace("\n", " ")
             if len(prev) > 85:
                 prev = prev[:85] + "…"
-            self.pinned_jump_btn.setText(f"📌 Закреплено: {prev}")
+            self.pinned_jump_btn.setText(f"Закреплено: {prev}")
+            self.pinned_jump_btn.setIcon(
+                _render_svg_icon("pin.svg", get_theme().get("accent", "#6c748a"), 14)
+            )
+            self.pinned_unpin_btn._update_icon()
             self.pinned_banner.setVisible(True)
         else:
             self._current_pinned_msg_id = ""
@@ -7561,7 +7768,7 @@ class MainScreen(QFrame):
         self._reply_to_text = None
         self._reply_to_sender = None
         self._editing_msg_id = msg_id
-        self.reply_preview_sender.setText("✏ Редактирование сообщения")
+        self.reply_preview_sender.setText("Редактирование сообщения")
         preview = current_text[:60] + "…" if len(current_text) > 60 else current_text
         self.reply_preview_text.setText(preview)
         self.reply_preview.setVisible(True)

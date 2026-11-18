@@ -291,6 +291,9 @@ class MessageBubble(QFrame):
         self._skeleton = None
         self._doc_meta = None
         self.doc_frame = None
+        self._doc_icon_lbl = None
+        self._delivery_status = "read" if self.is_read else "sent"
+        self._delivery_tooltip = ""
         self.edited_label = None
 
         self.setFocusPolicy(Qt.NoFocus)
@@ -384,15 +387,11 @@ class MessageBubble(QFrame):
         self.meta_layout.addWidget(self.time_label)
 
         if self.is_mine:
-            self.status_label = QLabel("✓✓" if self.is_read else "✓")
+            self.status_label = QLabel()
             self.status_label.setObjectName("BubbleStatus")
             self.status_label.setFocusPolicy(Qt.NoFocus)
-            self.status_label.setProperty("read", self.is_read)
-            self.status_label.setToolTip(
-                "Собеседник подтвердил прочтение"
-                if self.is_read
-                else "Сохранено; не является подтверждением прочтения"
-            )
+            self.status_label.setFixedSize(14, 14)
+            self._set_delivery_status("read" if self.is_read else "sent")
             self.meta_layout.addWidget(self.status_label)
 
         self.bubble_layout.addWidget(self.msg_label)
@@ -438,7 +437,7 @@ class MessageBubble(QFrame):
             display_text = "Голосовое"
         elif display_text.startswith("[FILE_META]|"):
             parts = display_text.split("|", 5)
-            display_text = f"📄 {parts[3]}" if len(parts) >= 4 else "Документ"
+            display_text = f"Документ: {parts[3]}" if len(parts) >= 4 else "Документ"
 
         self.reply_frame = QFrame()
         self.reply_frame.setObjectName("ReplyBlock")
@@ -448,7 +447,7 @@ class MessageBubble(QFrame):
         reply_layout.setContentsMargins(8, 6, 8, 6)
         reply_layout.setSpacing(8)
 
-        # ✅ Используем общий SVG рендерер
+        # Use the shared, theme-aware SVG renderer.
         from app.theme import get_theme
         t = get_theme()
 
@@ -619,7 +618,7 @@ class MessageBubble(QFrame):
         if self.msg_id:
             sender = self._sender if not self.is_mine else "Вы"
             if self._doc_meta:
-                text = f"📄 {self._doc_meta[2]}"
+                text = f"Документ: {self._doc_meta[2]}"
             else:
                 text = self._text or ("Голосовое" if self._voice_data else "Фото")
             self.reply_requested.emit(self.msg_id, text, sender)
@@ -632,7 +631,7 @@ class MessageBubble(QFrame):
         if self.msg_id:
             sender = self._sender if not self.is_mine else "Вы"
             if self._doc_meta:
-                preview = f"📄 {self._doc_meta[2]}"
+                preview = f"Документ: {self._doc_meta[2]}"
             else:
                 preview = self._text or self._caption or ("Голосовое" if self._voice_data else "Фото")
             self.pin_requested.emit(self.msg_id, preview, sender)
@@ -697,37 +696,75 @@ class MessageBubble(QFrame):
                 self.caption_label.setVisible(False)
         else:
             self.image_label.setVisible(False)
-            self.msg_label.setText("❌ Не удалось отобразить изображение")
+            self.msg_label.setText("Не удалось отобразить изображение")
             self.msg_label.setVisible(True)
+
+    def _set_delivery_status(self, status: str, tooltip: str = None):
+        from app.theme import get_theme
+
+        t = get_theme()
+        icons = {
+            "pending": (
+                "status_pending.svg", t.get("text_dim", "#777e8e"),
+                "Ожидает отправки", "В локальной очереди; отправка ещё не подтверждена",
+            ),
+            "sent": (
+                "status_sent.svg", t.get("text_soft", "#a4aab8"),
+                "Отправлено", "Сохранено; не является подтверждением прочтения",
+            ),
+            "read": (
+                "status_read.svg", t.get("accent", "#6c748a"),
+                "Прочитано", "Собеседник подтвердил прочтение",
+            ),
+        }
+        icon_name, color, accessible_name, default_tooltip = icons.get(status, icons["sent"])
+        icon = _render_svg(icon_name, color, 14)
+        self._delivery_status = status if status in icons else "sent"
+        self._delivery_tooltip = tooltip or default_tooltip
+        self.status_label.setText("")
+        self.status_label.setPixmap(icon.pixmap(14, 14))
+        self.status_label.setToolTip(self._delivery_tooltip)
+        if hasattr(self.status_label, "setAccessibleName"):
+            self.status_label.setAccessibleName(accessible_name)
+        self.status_label.setProperty("deliveryState", self._delivery_status)
+        self.status_label.setProperty("read", self._delivery_status == "read")
+        style = self.status_label.style()
+        if style is not None:
+            style.unpolish(self.status_label)
+            style.polish(self.status_label)
 
     def set_pending(self, tooltip: str = None):
         if self.is_mine and not self.is_read and hasattr(self, "status_label"):
-            self.status_label.setText("⏳")
-            self.status_label.setToolTip(
-                tooltip or "В локальной очереди: отправка ещё не подтверждена сервером"
+            self._set_delivery_status(
+                "pending",
+                tooltip or "В локальной очереди: отправка ещё не подтверждена сервером",
             )
-            self.status_label.setProperty("read", False)
-            self.status_label.style().unpolish(self.status_label)
-            self.status_label.style().polish(self.status_label)
+
+    def mark_as_sent(self, tooltip: str = None):
+        if self.is_mine and not self.is_read and hasattr(self, "status_label"):
+            self._set_delivery_status(
+                "sent",
+                tooltip or "Сервер принял сообщение; это не подтверждение прочтения",
+            )
 
     def mark_as_read(self):
         if self.is_mine and not self.is_read:
             self.is_read = True
-            if hasattr(self, 'status_label'):
-                self.status_label.setText("✓✓")
-                self.status_label.setToolTip("Собеседник подтвердил прочтение")
-                self.status_label.setProperty("read", True)
-                self.status_label.style().unpolish(self.status_label)
-                self.status_label.style().polish(self.status_label)
+            if hasattr(self, "status_label"):
+                self._set_delivery_status("read", "Собеседник подтвердил прочтение")
 
     def apply_theme(self):
         self.bubble.setObjectName("BubbleOut" if self.is_mine else "BubbleIn")
         self.bubble.style().unpolish(self.bubble)
         self.bubble.style().polish(self.bubble)
 
-        if hasattr(self, 'status_label'):
-            self.status_label.style().unpolish(self.status_label)
-            self.status_label.style().polish(self.status_label)
+        if hasattr(self, "status_label"):
+            self._set_delivery_status(self._delivery_status, self._delivery_tooltip)
+
+        if self._doc_icon_lbl is not None:
+            from app.theme import get_theme
+            icon = _render_svg("attach.svg", get_theme().get("accent", "#6c748a"), 18)
+            self._doc_icon_lbl.setPixmap(icon.pixmap(18, 18))
 
         if self.play_btn and isinstance(self.play_btn, _VoicePlayButton):
             self.play_btn.refresh_theme()
@@ -743,7 +780,7 @@ class MessageBubble(QFrame):
                 if item and item.widget() and isinstance(item.widget(), QLabel):
                     icon_label = item.widget()
 
-                    # ✅ Всегда берём актуальный цвет темы
+                    # Always use the current theme color.
                     color = t.get("text_main")
 
                     icon = _render_svg("reply_small.svg", color, 14)
@@ -775,6 +812,14 @@ class MessageBubble(QFrame):
             row.setContentsMargins(10, 8, 10, 8)
             row.setSpacing(10)
 
+            from app.theme import get_theme
+            self._doc_icon_lbl = QLabel()
+            self._doc_icon_lbl.setObjectName("DocumentAttachmentIcon")
+            self._doc_icon_lbl.setFixedSize(18, 18)
+            self._doc_icon_lbl.setFocusPolicy(Qt.NoFocus)
+            doc_icon = _render_svg("attach.svg", get_theme().get("accent", "#6c748a"), 18)
+            self._doc_icon_lbl.setPixmap(doc_icon.pixmap(18, 18))
+
             info_col = QVBoxLayout()
             info_col.setSpacing(2)
             self._doc_title_lbl = QLabel()
@@ -790,13 +835,14 @@ class MessageBubble(QFrame):
             self._doc_dl_btn.setFocusPolicy(Qt.NoFocus)
             self._doc_dl_btn.clicked.connect(self._on_doc_download_clicked)
 
+            row.addWidget(self._doc_icon_lbl, 0, Qt.AlignVCenter)
             row.addLayout(info_col, 1)
             row.addWidget(self._doc_dl_btn, 0, Qt.AlignVCenter)
             self.bubble_layout.insertWidget(max(0, self.bubble_layout.count() - 2), self.doc_frame)
 
-        warn = " • ⚠ Исполняемый файл" if is_dangerous_executable_extension(safe_name) else " • E2EE"
-        self._doc_title_lbl.setText(f"📄 {safe_name}")
-        self._doc_size_lbl.setText(f"{format_file_size(size_bytes)}{warn}")
+        warning_text = " — Исполняемый файл" if is_dangerous_executable_extension(safe_name) else " — Сквозное шифрование"
+        self._doc_title_lbl.setText(safe_name)
+        self._doc_size_lbl.setText(f"{format_file_size(size_bytes)}{warning_text}")
         self.bubble.setMinimumWidth(280)
 
         if caption:

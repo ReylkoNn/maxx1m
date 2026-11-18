@@ -196,7 +196,7 @@ def test_private_notifications_mask_sender_and_content_and_mss_in_requirements(t
         in_app_toast=SimpleNamespace(show_notification=lambda t, m, is_group=False: shown.append((t, m, is_group)))
     )
     env["show_notification"](win, "@director", "Пароль от банка: 9911", is_group=False)
-    assert shown == [("Max1m", "🔒 Новое зашифрованное сообщение", False)]
+    assert shown == [("Max1m", "Новое зашифрованное сообщение", False)]
 
     # Verify `mss` is declared in max1m_desktop/requirements.txt
     req_txt = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text(encoding="utf-8")

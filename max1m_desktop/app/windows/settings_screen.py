@@ -45,11 +45,10 @@ def _render_svg(svg_name: str, color: str, size: int = 16) -> QIcon:
 
 def _render_svg_label(svg_name: str, color: str, size: int = 16) -> QLabel:
     label = QLabel()
+    label.setObjectName("SvgLabel")
     label.setFixedSize(size, size)
     label.setFocusPolicy(Qt.NoFocus)
-    # Явно прозрачный фон
     label.setAttribute(Qt.WA_TranslucentBackground, True)
-    label.setStyleSheet("background: transparent; border: none;")
     icon = _render_svg(svg_name, color, size)
     label.setPixmap(icon.pixmap(size, size))
     return label
@@ -59,6 +58,7 @@ class SettingsScreen(QFrame):
     close_requested = Signal()
     logout_requested = Signal()
     call_audio_prefs_changed = Signal(dict)
+    audio_devices_changed = Signal(object, object)
 
     def __init__(self):
         super().__init__()
@@ -414,11 +414,8 @@ class SettingsScreen(QFrame):
         self.lock_now_btn.clicked.connect(self.lock_now_ui)
 
         self.panic_wipe_btn = QPushButton("Экстренное стирание (Panic Wipe)")
-        self.panic_wipe_btn.setObjectName("SecondaryBtn")
+        self.panic_wipe_btn.setObjectName("DangerButton")
         self.panic_wipe_btn.setFocusPolicy(Qt.NoFocus)
-        self.panic_wipe_btn.setStyleSheet(
-            f"color: {t.get('danger', '#e55c6c')}; border-color: {t.get('danger', '#e55c6c')};"
-        )
         self.panic_wipe_btn.clicked.connect(self.trigger_panic_wipe_ui)
 
         vault_btn_row.addWidget(self.enable_vault_btn)
@@ -501,7 +498,7 @@ class SettingsScreen(QFrame):
                 if is_current
                 else ("отозвано" if is_revoked else "активно")
             )
-            mismatch_warn = " [⚠️ подменён отпечаток сервера]" if fp_mismatch else ""
+            mismatch_warn = " [подменён отпечаток сервера]" if fp_mismatch else ""
 
             info_lbl = QLabel(
                 f"{dev.get('device_name', 'Устройство')} [{badge}]{mismatch_warn}\n"
@@ -1103,7 +1100,7 @@ class SettingsScreen(QFrame):
                         outputs.append(entry)
 
         except Exception as e:
-            print(f"[Audio] ❌ Ошибка перечисления: {e}")
+            print(f"[Audio] Ошибка перечисления: {e}")
 
         print(f"[Audio] Найдено: {len(inputs)} входов, {len(outputs)} выходов")
         for d in inputs:
@@ -1249,12 +1246,18 @@ class SettingsScreen(QFrame):
         dev_name = self.mic_combo.currentText()
         rtc.set_input_device(dev_index)
         self.audio_status.setText(f"Микрофон: {dev_name}")
+        self.audio_devices_changed.emit(
+            rtc.input_device_index, rtc.output_device_index
+        )
 
     def _on_spk_changed(self, index):
         dev_index = self.spk_combo.itemData(index)
         dev_name = self.spk_combo.currentText()
         rtc.set_output_device(dev_index)
         self.audio_status.setText(f"Динамики: {dev_name}")
+        self.audio_devices_changed.emit(
+            rtc.input_device_index, rtc.output_device_index
+        )
 
     def refresh_tls_pin_info(self):
         lbl = getattr(self, "_tls_pin_status_label", None)

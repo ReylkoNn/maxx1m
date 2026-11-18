@@ -9,9 +9,14 @@ Tests for Package IV (Desktop):
    and 1-click peer screen share request flow.
 """
 
+import ast
 import json
 import math
+import sys
+import threading
 import time
+import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -303,3 +308,145 @@ def test_mic_fanout_and_group_voice_controller_e2ee_signal_and_1click_screen(mon
     )
 
     ctrl.leave_local_session()
+
+
+def test_group_voice_opens_the_selected_microphone_and_speakers(monkeypatch):
+    opens = []
+    stopped = threading.Event()
+
+    class Stream:
+        def read(self, _frames, exception_on_overflow=False):
+            stopped.wait(0.01)
+            return SILENCE_FRAME
+        def write(self, _data, _frames):
+            stopped.wait(0.005)
+        def stop_stream(self): stopped.set()
+        def close(self): pass
+
+    class PyAudio:
+        def open(self, **kwargs):
+            opens.append(dict(kwargs))
+            return Stream()
+        def terminate(self): pass
+
+    audio_module = types.ModuleType("pyaudio")
+    audio_module.PyAudio = PyAudio
+    audio_module.paInt16 = 8
+    monkeypatch.setitem(sys.modules, "pyaudio", audio_module)
+
+    controller = GroupVoiceRoomController(send_signal_fn=lambda *args: None)
+    controller.set_audio_devices(4, 7)
+    assert controller._start_hardware_audio() is True
+    try:
+        assert [item.get("input_device_index") for item in opens if item.get("input")] == [4]
+        assert [item.get("output_device_index") for item in opens if item.get("output")] == [7]
+    finally:
+        controller._stop_hardware_audio()
+
+
+def test_group_voice_join_passes_selected_call_audio_devices_to_controller():
+    source = Path(__file__).resolve().parents[1] / "app/windows/main_screen.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    method_node = next(
+        node for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == "MainScreen"
+        for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_on_gv_worker_finished"
+    )
+    calls = []
+    state = types.SimpleNamespace(
+        username="alice", server_url="https://server.test", device_id="alice-device", token="token"
+    )
+    env = {
+        "state": state,
+        "rtc": types.SimpleNamespace(input_device_index=4, output_device_index=7),
+        "storage": types.SimpleNamespace(get_call_audio_prefs=lambda _username: {"push_to_talk": True}),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[method_node], type_ignores=[])), str(source), "exec"), env)
+
+    worker = types.SimpleNamespace(
+        account_context=("alice", "https://server.test", "alice-device", "token"),
+        wait=lambda: None,
+    )
+    controller = types.SimpleNamespace(
+        active_group_id=None,
+        start_local_session=lambda **kwargs: calls.append(kwargs),
+    )
+    screen = types.SimpleNamespace(
+        _net_workers=[worker], _group_voice_rosters={},
+        _group_voice_ctrl=controller,
+        _refresh_group_voice_bar=lambda: None,
+    )
+    env["_on_gv_worker_finished"](screen, True, {"participants": []}, "group-1", "join", worker)
+
+    assert len(calls) == 1
+    assert calls[0]["input_device_index"] == 4
+    assert calls[0]["output_device_index"] == 7
+    assert calls[0]["audio_prefs"] == {"push_to_talk": True}
+
+
+def test_audio_device_change_restarts_live_group_room_streams():
+    source = Path(__file__).resolve().parents[1] / "app/windows/main_screen.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    method_node = next(
+        node for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == "MainScreen"
+        for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "on_audio_devices_changed"
+    )
+    calls = []
+    screen = types.SimpleNamespace(
+        _group_voice_ctrl=types.SimpleNamespace(set_audio_devices=lambda *args: calls.append(args))
+    )
+    # Use the method body extracted from the app rather than duplicating behavior in the test.
+    namespace = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[method_node], type_ignores=[])), str(source), "exec"), namespace)
+    namespace["on_audio_devices_changed"](screen, 5, 8)
+    assert calls == [(5, 8)]
+
+
+def test_settings_device_selection_emits_current_call_audio_indices():
+    source = Path(__file__).resolve().parents[1] / "app/windows/settings_screen.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    wanted = {"_on_mic_changed", "_on_spk_changed"}
+    methods = [
+        node for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == "SettingsScreen"
+        for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
+    rtc = types.SimpleNamespace(input_device_index=None, output_device_index=None)
+    rtc.set_input_device = lambda index: setattr(rtc, "input_device_index", index)
+    rtc.set_output_device = lambda index: setattr(rtc, "output_device_index", index)
+    env = {"rtc": rtc}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=methods, type_ignores=[])), str(source), "exec"), env)
+
+    class Combo:
+        def __init__(self, device_index, name): self.device_index, self.name = device_index, name
+        def itemData(self, _index): return self.device_index
+        def currentText(self): return self.name
+
+    emitted = []
+    screen = types.SimpleNamespace(
+        mic_combo=Combo(4, "USB Mic"), spk_combo=Combo(7, "Headphones"),
+        audio_status=types.SimpleNamespace(setText=lambda _text: None),
+        audio_devices_changed=types.SimpleNamespace(emit=lambda *args: emitted.append(args)),
+    )
+    env["_on_mic_changed"](screen, 0)
+    env["_on_spk_changed"](screen, 0)
+    assert emitted == [(4, None), (4, 7)]
+
+
+def test_group_voice_reports_audio_initialization_failure(monkeypatch):
+    errors = []
+
+    class BrokenPyAudio:
+        def open(self, **_kwargs):
+            raise OSError("device unavailable")
+        def terminate(self): pass
+
+    audio_module = types.ModuleType("pyaudio")
+    audio_module.PyAudio = BrokenPyAudio
+    audio_module.paInt16 = 8
+    monkeypatch.setitem(sys.modules, "pyaudio", audio_module)
+
+    controller = GroupVoiceRoomController(
+        send_signal_fn=lambda *args: None,
+        on_error=errors.append,
+    )
+    assert controller._start_hardware_audio() is False
+    assert errors and "микрофон" in errors[-1].lower()
