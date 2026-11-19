@@ -58,6 +58,85 @@ def dr_env(tmp_path, monkeypatch):
     return base, alice_cm, bob_cm, eve_cm
 
 
+@pytest.mark.parametrize(("failure_stage", "expected_stage"), [
+    ("lookup", "session_lookup"),
+    ("encrypt", "encrypt"),
+])
+def test_active_ratchet_failure_does_not_fall_back_to_box(monkeypatch, failure_stage, expected_stage):
+    import app.double_ratchet as dr
+
+    class BrokenStore:
+        def __init__(self, _username):
+            pass
+
+        def has_active_session(self, *_args):
+            if failure_stage == "lookup":
+                raise RuntimeError("private-store-detail")
+            return True
+
+        def encrypt_for_peer(self, **_kwargs):
+            raise RuntimeError("private-ratchet-detail")
+
+    class Crypto:
+        private_key = object()
+
+        def get_public_key_b64(self):
+            return "public-key"
+
+        def encrypt_message(self, *_args):
+            pytest.fail("active DR failure must never downgrade to Box")
+
+    monkeypatch.setattr(dr, "RatchetStore", BrokenStore)
+    with pytest.raises(dr.DoubleRatchetEncryptionError) as exc_info:
+        dr.encrypt_personal_envelope(
+            owner_username="alice",
+            owner_device_id="alice-device",
+            crypto_mgr=Crypto(),
+            recipient_device_id="bob-device",
+            recipient_pub_b64="peer-key",
+            plaintext="private message body",
+            msg_kind="text",
+        )
+    assert exc_info.value.stage == expected_stage
+    assert exc_info.value.cause_type == "RuntimeError"
+    assert str(exc_info.value) == "Double Ratchet encryption failed"
+
+
+def test_absent_ratchet_session_still_uses_legacy_box(monkeypatch):
+    import app.double_ratchet as dr
+
+    class NoSessionStore:
+        def __init__(self, _username):
+            pass
+
+        def has_active_session(self, *_args):
+            return False
+
+    class Crypto:
+        private_key = object()
+
+        def get_public_key_b64(self):
+            return "public-key"
+
+        def encrypt_message(self, plaintext, recipient):
+            assert plaintext == "private message body"
+            assert recipient == "peer-key"
+            return {"encrypted_blob": "box-envelope", "signature": "box-signature"}
+
+    monkeypatch.setattr(dr, "RatchetStore", NoSessionStore)
+    envelope, used_ratchet = dr.encrypt_personal_envelope(
+        owner_username="alice",
+        owner_device_id="alice-device",
+        crypto_mgr=Crypto(),
+        recipient_device_id="bob-device",
+        recipient_pub_b64="peer-key",
+        plaintext="private message body",
+        msg_kind="text",
+    )
+    assert envelope["encrypted_blob"] == "box-envelope"
+    assert used_ratchet is False
+
+
 def test_x3dh_double_ratchet_out_of_order_forward_secrecy_and_post_compromise_healing(dr_env, tmp_path):
     base, alice_cm, bob_cm, eve_cm = dr_env
     alice_pub = alice_cm.get_public_key_b64()
@@ -333,8 +412,10 @@ def test_double_ratchet_outbox_policy_and_two_phase_crash_safe_delivery(dr_env):
             }
         },
     )
+    # Live WS notifications historically use `message_id`, while sync-safe
+    # pages use `id`. They must share the same replay/persistence marker.
     wire_env = {
-        "id": "srv-dr-100",
+        "message_id": "srv-dr-100",
         "sender_device_id": "alice-dev",
         **env_att,
     }
@@ -366,3 +447,122 @@ def test_double_ratchet_outbox_policy_and_two_phase_crash_safe_delivery(dr_env):
     conflicting_wire = {"id": "srv-dr-100", "sender_device_id": "alice-dev", **env2}
     with pytest.raises(IncomingIdentityError):
         verify_incoming(bob_state, bob_cm, conflicting_wire)
+
+
+def test_live_ws_message_id_is_persisted_and_sync_redelivery_is_idempotent(dr_env, caplog):
+    import ast
+    import logging
+    from pathlib import Path
+    from app.diagnostics import safe_identifier_tag
+
+    _, alice_cm, bob_cm, _ = dr_env
+    alice_pub = alice_cm.get_public_key_b64()
+    bob_pub = bob_cm.get_public_key_b64()
+    bob_store = RatchetStore("bob")
+    bundle = bob_store.prepare_publish_bundle(bob_cm.private_key, needed_opks=1)
+    claimed_bundle = {
+        "device_id": "bob-dev",
+        "identity_key": bob_pub,
+        "signed_prekey": bundle["signed_prekey"],
+        "signature": bundle["signature"],
+        "version": bundle["version"],
+        "one_time_key": bundle["one_time_keys"][0],
+    }
+    alice_store = RatchetStore("alice")
+    alice_store.init_initiator_session_from_bundle(
+        our_signing_key=alice_cm.private_key,
+        peer_device_id="bob-dev",
+        peer_verified_ik_b64=bob_pub,
+        claimed_bundle=claimed_bundle,
+    )
+    plaintext = json.dumps({"type": "text", "text": "delivered once", "msg_id": "local-1"})
+    envelope, used_dr = encrypt_personal_envelope(
+        owner_username="alice",
+        owner_device_id="alice-dev",
+        crypto_mgr=alice_cm,
+        recipient_device_id="bob-dev",
+        recipient_pub_b64=bob_pub,
+        plaintext=plaintext,
+        msg_kind="text",
+    )
+    assert used_dr
+    delivery_id = "srv-live-200"
+    live_event = {
+        "type": "new_message",
+        "message_id": delivery_id,
+        "sender_device_id": "alice-dev",
+        **envelope,
+    }
+    bob_state = SimpleNamespace(
+        username="bob",
+        device_id="bob-dev",
+        server_url="https://node.local",
+        token="session",
+        allies={
+            "alice": {
+                "devices": [{
+                    "device_id": "alice-dev",
+                    "public_key": alice_pub,
+                    "verified_fingerprint": fingerprint_public_key(alice_pub),
+                    "verified_scope": {
+                        "username": "bob",
+                        "device_id": "bob-dev",
+                        "server_url": "https://node.local",
+                    },
+                }],
+            },
+        },
+    )
+    path = Path(__file__).resolve().parents[1] / "app/windows/main_screen.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    method = next(
+        node for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == "MainScreen"
+        for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "process_incoming_message"
+    )
+    namespace = {
+        "state": bob_state,
+        "crypto": bob_cm,
+        "verify_incoming": verify_incoming,
+        "IncomingIdentityError": IncomingIdentityError,
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])), str(path), "exec"), namespace)
+    handled = []
+    emitted = []
+
+    class Screen:
+        _incoming_identity_notice_shown = False
+        incoming_message_processed = SimpleNamespace(emit=lambda data: emitted.append(data))
+
+        def window(self):
+            return SimpleNamespace(show_notification=lambda *args: None)
+
+        def _handle_decrypted_payload(self, sender, decrypted, signature, is_sync=False, **_kwargs):
+            payload = json.loads(decrypted)
+            handled.append(payload["type"])
+            if payload["type"] == "dr_already_processed":
+                return True
+            saved = SecureStorage.save_message(
+                "bob", sender, payload["text"], False, msg_id=payload["msg_id"]
+            )
+            diagnostic_stage = _kwargs.get("diagnostic_stage")
+            if callable(diagnostic_stage):
+                diagnostic_stage("history_persisted", persisted=True)
+            return saved
+
+    screen = Screen()
+    screen.process_incoming_message = namespace["process_incoming_message"].__get__(screen)
+
+    # Live WebSocket delivery is saved, then the same server ID can safely be
+    # returned by sync-safe (whether as `message_id` or canonical `id`).
+    with caplog.at_level(logging.INFO, logger="max1m.delivery"):
+        assert screen.process_incoming_message(live_event)
+        assert screen.process_incoming_message(live_event)
+        assert screen.process_incoming_message({**live_event, "id": delivery_id}, is_sync=True)
+    assert handled == ["text", "dr_already_processed", "dr_already_processed"]
+    assert len(SecureStorage.load_messages_strict("bob", "alice")) == 1
+    assert all(event["id"] == delivery_id for event in emitted)
+    assert safe_identifier_tag(delivery_id) in caplog.text
+    assert "incoming.history.persisted result=stored_or_duplicate" in caplog.text
+    assert "incoming.ratchet.persist_marker_written" in caplog.text
+    for private_value in (delivery_id, "delivered once", "session", envelope["encrypted_blob"], envelope["signature"]):
+        assert private_value not in caplog.text

@@ -38,10 +38,16 @@ def test_unverified_unknown_ambiguous_and_changed_key_are_not_accepted(setup):
     trust(device)
     context, plaintext = verify_incoming(state, receiver, envelope)
     assert context.username == "sender" and json.loads(plaintext)["text"] == "private"
-    with pytest.raises(IncomingIdentityError):
+    with pytest.raises(IncomingIdentityError) as unknown_error:
         verify_incoming(state, receiver, {**envelope, "sender_device_id": "unknown"})
-    state.allies["other"] = {"devices": [device.copy()]}
-    with pytest.raises(IncomingIdentityError): verify_incoming(state, receiver, envelope)
+    assert unknown_error.value.reason == "unknown_sender_device"
+    assert unknown_error.value.match_count == 0
+    assert isinstance(unknown_error.value.sender_tag, str) and len(unknown_error.value.sender_tag) == 12
+    state.allies["other"] = {"user_id": "other-user", "devices": [device.copy()]}
+    with pytest.raises(IncomingIdentityError) as ambiguous_error:
+        verify_incoming(state, receiver, envelope)
+    assert ambiguous_error.value.reason == "ambiguous_sender_device"
+    assert ambiguous_error.value.match_count == 2
     state.allies.pop("other")
     device["public_key"] = other.get_public_key_b64()
     with pytest.raises(IncomingIdentityError): verify_incoming(state, receiver, envelope)
@@ -55,6 +61,37 @@ def test_forgery_and_wrong_recipient_are_rejected(setup):
     with pytest.raises(IncomingIdentityError): verify_incoming(state, receiver, {**envelope, "signature": "bad"})
     with pytest.raises(IncomingIdentityError): verify_incoming(state, other, envelope)
     with pytest.raises(IncomingIdentityError): verify_incoming(state, receiver, [])
+
+
+def test_directory_hint_disambiguates_only_between_saved_local_contacts(setup):
+    state, _, receiver, _, device, envelope = setup
+    trust(device)
+
+    # A unique locally stored key remains usable even if optional relay hints
+    # are stale or malformed; the signature still has to verify below.
+    for hint in (
+        {"sender_username": "sender", "sender_user_id": "different-user"},
+        {"sender_username": "sender"},
+    ):
+        context, plaintext = verify_incoming(state, receiver, {**envelope, **hint})
+        assert context.username == "sender" and json.loads(plaintext)["text"] == "private"
+
+    # A duplicate local device ID is resolvable only when the relay hint maps
+    # to exactly one existing contact with that contact's local user_id.
+    state.allies["other"] = {"user_id": "other-user", "devices": [dict(device)]}
+    context, plaintext = verify_incoming(state, receiver, {
+        **envelope, "sender_username": "sender", "sender_user_id": "sender-user",
+    })
+    assert context.username == "sender" and json.loads(plaintext)["text"] == "private"
+
+    for hint in (
+        {"sender_username": "sender", "sender_user_id": "different-user"},
+        {"sender_username": "sender"},
+    ):
+        with pytest.raises(IncomingIdentityError) as ambiguous:
+            verify_incoming(state, receiver, {**envelope, **hint})
+        assert ambiguous.value.reason == "ambiguous_sender_device"
+        assert ambiguous.value.match_count == 2
 
 
 def test_durable_write_precedes_ack_and_failure_is_retried(setup, monkeypatch):
@@ -91,8 +128,13 @@ def test_new_devices_are_candidates_never_implicitly_verified(setup):
     assert len(existing["devices"]) == 1
     with pytest.raises(ValueError):
         newly_advertised_devices(existing, {**incoming, "user_id": "changed"}, state.allies, "sender")
-    with pytest.raises(ValueError):
-        newly_advertised_devices(existing, {**incoming, "devices": [new_device]}, state.allies, "sender")
+    # A revoked device may disappear from the relay directory; refreshes only
+    # append candidates and never delete its existing local verification record.
+    revoked_old_missing = newly_advertised_devices(
+        existing, {**incoming, "devices": [new_device]}, state.allies, "sender"
+    )
+    assert len(revoked_old_missing) == 1
+    assert len(existing["devices"]) == 1
     with pytest.raises(ValueError):
         newly_advertised_devices(existing, {**incoming, "devices": [{**device, "public_key": other.get_public_key_b64()}]}, state.allies, "sender")
     state.allies["another"] = {"devices": [{**new_device}]}
@@ -107,6 +149,42 @@ def extract_method(name, namespace):
     method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])), "main_screen.py", "exec"), namespace)
     return namespace[name]
+
+
+def test_payload_persistence_exception_is_categorized_without_sensitive_data(setup, caplog):
+    import logging
+    from app.diagnostics import safe_identifier_tag
+
+    state, _, receiver, _, device, envelope = setup
+    trust(device)
+    private_value = "private-storage-message-content"
+    state.token = "private-session-token"
+
+    class Screen:
+        _incoming_identity_notice_shown = False
+        incoming_message_processed = SimpleNamespace(emit=lambda _value: pytest.fail("must not emit on failed save"))
+
+        def window(self):
+            return SimpleNamespace(show_notification=lambda *_args: None)
+
+        def _handle_decrypted_payload(self, _sender, _plaintext, _signature, _is_sync,
+                                      *, diagnostic_stage=None, **_kwargs):
+            diagnostic_stage("history_persist")
+            raise OSError(private_value)
+
+    screen = Screen()
+    screen.process_incoming_message = extract_method("process_incoming_message", {
+        "state": state, "crypto": receiver, "verify_incoming": verify_incoming,
+        "IncomingIdentityError": IncomingIdentityError,
+    }).__get__(screen)
+
+    with caplog.at_level(logging.INFO, logger="max1m.delivery"):
+        assert not screen.process_incoming_message(envelope, is_sync=True)
+
+    assert "incoming.reject stage=history_persist reason=payload_processing_failed" in caplog.text
+    assert safe_identifier_tag("server-id") in caplog.text
+    for secret in (private_value, "private-session-token", "sender-device", "receiver-device"):
+        assert secret not in caplog.text
 
 
 def test_real_incoming_callback_only_acks_after_verification_and_storage(setup, monkeypatch):
@@ -135,7 +213,13 @@ def test_real_incoming_callback_only_acks_after_verification_and_storage(setup, 
     assert process_delivery_page([envelope], process)[0] == []
     assert not signals
     monkeypatch.setattr(SecureStorage, "_save_messages_to_file", original)
-    assert process_delivery_page([envelope], process)[0] == ["server-id"]
+    # Legacy duplicate device IDs can be resolved with the server hint, but
+    # only against a locally verified entry and only after durable processing.
+    state.allies["other"] = {"user_id": "other-user", "devices": [dict(device)]}
+    hinted_envelope = {
+        **envelope, "sender_username": "sender", "sender_user_id": "sender-user",
+    }
+    assert process_delivery_page([hinted_envelope], process)[0] == ["server-id"]
     assert len(signals) == 1
 
 

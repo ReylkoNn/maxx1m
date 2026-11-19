@@ -36,6 +36,10 @@ def main():
 
     eff_inst, qt_argv = _configure_instance_env_from_argv(sys.argv)
 
+    # Install file-based diagnostics before importing Qt or starting workers.
+    from app.diagnostics import initialize_diagnostics
+    initialize_diagnostics()
+
     if sys.platform == "win32":
         suffix = f".inst_{eff_inst}" if (eff_inst and eff_inst != "1") else ""
         app_id = f"Max1m.Secure.Messenger.v1{suffix}"

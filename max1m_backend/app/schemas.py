@@ -104,6 +104,10 @@ class MessageDeliveryAck(BaseModel):
 class MessageResponse(BaseModel):
     id: str
     sender_device_id: str
+    # Relay-derived directory metadata is a hint for refreshing an existing
+    # contact, never proof of identity or a replacement for key verification.
+    sender_user_id: str | None = None
+    sender_username: str | None = None
     encrypted_blob: str
     signature: str
     created_at: datetime
@@ -129,6 +133,11 @@ class UserLookupResponse(BaseModel):
     user_id: str
     username: str
     devices: list[DevicePublicInfo]
+
+
+class OnlineDevicesResponse(BaseModel):
+    username: str
+    online_device_ids: list[str]
 
 # ============================================================================
 # ГРУППЫ

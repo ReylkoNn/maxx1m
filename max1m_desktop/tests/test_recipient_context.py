@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 import pytest
-from app.recipient_context import capture_recipient, recipient_still_trusted, is_active_recipient
+from app.recipient_context import (
+    capture_recipient, recipient_still_trusted, is_active_recipient, choose_online_device,
+)
 
 
 def state():
@@ -74,3 +76,18 @@ def test_invalid_key_cannot_be_verified():
     ctx = capture_recipient(s)
     s.allies["bob"]["devices"][0]["verified_fingerprint"] = "bad"
     assert not recipient_is_verified(s, ctx)
+
+
+def test_online_device_selection_requires_a_locally_verified_known_key():
+    devices = [
+        {"device_id": "old"},
+        {"device_id": "phone"},
+        {"device_id": "laptop"},
+    ]
+    # Preserve the user's preferred choice when it is online and trusted.
+    assert choose_online_device(devices, ["phone", "laptop"], "phone", {"phone", "laptop"}) == "phone"
+    # Otherwise choose an online trusted device; never select a server-only device or unverified key.
+    assert choose_online_device(devices, ["old", "phone", "unknown"], "laptop", {"phone"}) == "phone"
+    assert choose_online_device(devices, ["phone"], "phone", set()) is None
+    assert choose_online_device(devices, ["unknown"], None, {"unknown"}) is None
+    assert choose_online_device({}, ["phone"], verified_device_ids={"phone"}) is None

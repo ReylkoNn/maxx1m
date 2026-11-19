@@ -595,3 +595,45 @@ async def find_user(
         d in devices]
 
     return {"user_id": user.id, "username": user.username, "devices": dev_list}
+
+
+@router.get("/online-devices/{target_username}", response_model=schemas.OnlineDevicesResponse)
+@limiter.limit(settings.RATE_LIMIT_LOGIN)
+async def get_online_devices(
+        request: Request,
+        target_username: str,
+        _device_id: str = Depends(get_current_device_id),
+        db: AsyncSession = Depends(get_db),
+):
+    """Return the target account's active devices connected to this relay process.
+
+    Presence is advisory and deliberately contains no last-seen timestamp. The
+    caller must still verify the selected device key before sending or calling.
+    """
+    clean_username = target_username.lstrip("@")
+    if not _USERNAME_LOOKUP_RE.fullmatch(clean_username):
+        raise HTTPException(status_code=404, detail="Союзник с таким тегом не найден.")
+
+    user = (await db.execute(
+        select(models.User).where(
+            models.User.username == clean_username,
+            models.User.is_active == True,
+        )
+    )).scalars().first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="Союзник с таким тегом не найден.")
+
+    device_ids = (await db.execute(
+        select(models.Device.id).where(
+            models.Device.user_id == user.id,
+            models.Device.is_revoked == False,
+        ).order_by(models.Device.created_at.asc(), models.Device.id.asc())
+    )).scalars().all()
+    if not device_ids:
+        raise HTTPException(status_code=404, detail="Союзник с таким тегом не найден.")
+
+    return {
+        "username": user.username,
+        "online_device_ids": [device_id for device_id in device_ids
+                              if device_id in manager.active_connections],
+    }

@@ -334,3 +334,123 @@ def test_encrypted_groups_index_and_archived_group_restoration_across_restart(tm
     assert [m['text'] for m in store.load_messages('alice', 'group_g_orphan')] == ['Pre-existing group message']
     persisted = store.load_groups_index('alice')
     assert persisted['g_active']['archived'] is False and persisted['g_left']['archived'] is True
+
+
+def test_open_group_tolerates_missing_display_name_and_sender_key_failure():
+    path = Path(__file__).resolve().parents[1] / 'app/windows/main_screen.py'
+    tree = ast.parse(path.read_text())
+    nodes = [n for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == 'MainScreen'
+             for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_on_group_selected']
+    env = {
+        'state': SimpleNamespace(current_chat_type=None, current_group_id=None,
+                                 current_chat_username=None, current_chat_device_id=None,
+                                 groups={'group-1': {'archived': False}}),
+        'Qt': SimpleNamespace(UserRole=1),
+        'GroupCardWidget': type('GroupCardWidget', (), {}),
+        'GROUP_CHAT_SEND_ENABLED': True,
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(path), 'exec'), env)
+
+    class Item:
+        def data(self, _role): return 'group-1'
+    card = env['GroupCardWidget']()
+    card.reset_unread = lambda: None
+
+    class Screen:
+        _on_group_selected = env['_on_group_selected']
+        def __init__(self):
+            self.groups_list = SimpleNamespace(itemWidget=lambda _item: card)
+            self.chat_title = SimpleNamespace(setText=lambda value: setattr(self, 'title', value))
+            self.identity_status = SimpleNamespace(setVisible=lambda _value: None)
+            self.call_btn = SimpleNamespace(setVisible=lambda _value: None)
+            self.group_voice_btn = SimpleNamespace(setVisible=lambda _value: None)
+            self.search_btn = SimpleNamespace(setVisible=lambda _value: None)
+            self.chat_menu_btn = SimpleNamespace(setVisible=lambda _value: None)
+            self.chat_area = object()
+            self.right_stack = SimpleNamespace(setCurrentWidget=lambda _value: None)
+            self.msg_input = SimpleNamespace(setEnabled=lambda _value: None,
+                setPlaceholderText=lambda value: setattr(self, 'placeholder', value), setFocus=lambda: None)
+            self.attach_btn = SimpleNamespace(setEnabled=lambda _value: None)
+            self.mic_input_btn = SimpleNamespace(setEnabled=lambda _value: None)
+            self.send_btn = SimpleNamespace(setEnabled=lambda _value: None)
+            self._set_chat_header_icon = lambda _value: None
+            self._fetch_group_voice_state = lambda _gid: None
+            self._refresh_group_voice_bar = lambda: None
+            self.ensure_my_group_sender_key = lambda _gid: (_ for _ in ()).throw(RuntimeError('key state'))
+            self._render_history_page = lambda: setattr(self, 'rendered', True)
+    screen = Screen()
+    screen._on_group_selected(Item())
+    assert env['state'].current_group_id == 'group-1'
+    assert screen.title == 'Группа group-1'
+    assert 'Группа group-1' in screen.placeholder
+    assert screen.rendered
+
+
+def test_group_sender_key_setup_rejects_corrupt_epoch_without_raising():
+    path = Path(__file__).resolve().parents[1] / 'app/windows/main_screen.py'
+    tree = ast.parse(path.read_text())
+    nodes = [n for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == 'MainScreen'
+             for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'ensure_my_group_sender_key']
+    state = SimpleNamespace(token='token', device_id='self',
+        groups={'g1': {'epoch': 'not-an-epoch', 'archived': False}})
+    env = {'state': state}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(path), 'exec'), env)
+    Screen = type('Screen', (), {'ensure_my_group_sender_key': env['ensure_my_group_sender_key']})
+    assert Screen().ensure_my_group_sender_key('g1') is False
+    state.groups['g1']['epoch'] = True
+    assert Screen().ensure_my_group_sender_key('g1') is False
+
+
+def test_restoring_group_keys_skips_corrupt_epochs_and_keeps_valid_group_key():
+    path = Path(__file__).resolve().parents[1] / 'app/windows/main_screen.py'
+    tree = ast.parse(path.read_text())
+    nodes = [n for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == 'MainScreen'
+             for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'restore_persisted_group_keys']
+    state = SimpleNamespace(username='alice', groups={
+        'good': {'epoch': 1, 'archived': False, 'sender_keys': {}},
+        'bad': {'epoch': 1, 'archived': False, 'sender_keys': {}},
+    })
+    persisted = {
+        'good': {
+            'epoch': 2, 'distributed_epoch': 2, 'my_sender_key': {'epoch': 2},
+            'sender_keys': {'peer': {'key_id': 'valid-key'}},
+        },
+        'bad': {'epoch': 'not-an-epoch', 'sender_keys': {}},
+    }
+    stored = []
+    env = {
+        'state': state,
+        'storage': SimpleNamespace(load_group_keys=lambda _user: persisted),
+        'store_member_sender_key': lambda target, device, key: stored.append((target, device, key)),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(path), 'exec'), env)
+    Screen = type('Screen', (), {'restore_persisted_group_keys': env['restore_persisted_group_keys']})
+    Screen().restore_persisted_group_keys()
+    assert state.groups['good']['epoch'] == 2
+    assert state.groups['good']['my_sender_key'] == {'epoch': 2}
+    assert state.groups['good']['distributed_epoch'] == 2
+    assert stored and stored[0][1] == 'peer'
+    assert state.groups['bad']['epoch'] == 1
+
+
+def test_group_voice_roster_is_sanitized_before_ui_render():
+    path = Path(__file__).resolve().parents[1] / 'app/windows/main_screen.py'
+    tree = ast.parse(path.read_text())
+    node = next(n for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == 'MainScreen'
+                for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_normalize_group_voice_roster')
+    node.decorator_list = []
+    env = {}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), str(path), 'exec'), env)
+    normalize = env['_normalize_group_voice_roster']
+    roster = normalize([
+        None,
+        {'device_id': '../bad', 'username': 'evil'},
+        {'device_id': 'device_1', 'username': [], 'is_muted': 'false', 'public_key': 'key'},
+        {'device_id': 'device_1', 'username': 'duplicate'},
+        *[{'device_id': f'device-{n}', 'username': f'user{n}', 'public_key': 'key'} for n in range(1, 12)],
+    ])
+    assert len(roster) == 8
+    assert roster[0]['device_id'] == 'device_1'
+    assert roster[0]['username'] == 'device_1'
+    assert roster[0]['is_muted'] is False
+    assert len({entry['device_id'] for entry in roster}) == len(roster)

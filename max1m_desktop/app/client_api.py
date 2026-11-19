@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import logging
 import os
 import urllib.parse
 import requests
@@ -8,6 +9,14 @@ import re
 from typing import Tuple, Any
 from app.media_identity import valid_file_id
 
+logger = logging.getLogger("max1m.delivery")
+
+
+def _safe_identifier_tag(value):
+    """Produce a short stable tag without exposing the identifier in logs."""
+    if not isinstance(value, str) or not value:
+        return "-"
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:12]
 MAX_SEND_RESPONSE_BYTES = 2 * 1024 * 1024  # Older servers echo the full ciphertext.
 MAX_DOWNLOAD_BYTES = 21 * 1024 * 1024  # Supports a 20 MiB image plus encryption overhead.
 _SAFE_DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -301,6 +310,45 @@ class APIClient:
         except (requests.exceptions.RequestException, OSError, ValueError, TypeError, RecursionError) as e:
             return False, f"Ошибка сети или ответа: {type(e).__name__}"
 
+    def get_online_devices(self, server_url: str, token: str, target_username: str) -> Tuple[bool, Any]:
+        url_ok, url_err = validate_server_url(server_url)
+        if not url_ok:
+            return False, url_err
+        clean = target_username.lstrip("@") if isinstance(target_username, str) else ""
+        if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", clean):
+            return False, "Некорректное имя контакта"
+        url = f"{server_url.rstrip('/')}/auth/online-devices/{clean}"
+        try:
+            response = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+                stream=True,
+                allow_redirects=False,
+            )
+            try:
+                if response.status_code != 200:
+                    return False, f"HTTP {response.status_code}: не удалось проверить подключённые устройства"
+                data = _small_response_json(response, 32 * 1024)
+                if not isinstance(data, dict) or data.get("username") != clean:
+                    raise ValueError("Invalid online devices response")
+                ids = data.get("online_device_ids")
+                if not isinstance(ids, list) or len(ids) > 256:
+                    raise ValueError("Invalid online devices response")
+                cleaned, seen = [], set()
+                for device_id in ids:
+                    if (not isinstance(device_id, str)
+                            or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", device_id)
+                            or device_id in seen):
+                        raise ValueError("Invalid online device id")
+                    seen.add(device_id)
+                    cleaned.append(device_id)
+                return True, cleaned
+            finally:
+                response.close()
+        except (requests.exceptions.RequestException, OSError, ValueError, TypeError, RecursionError) as e:
+            return False, f"Ошибка сети или ответа: {type(e).__name__}"
+
     def list_own_devices(
         self,
         server_url: str,
@@ -427,42 +475,68 @@ class APIClient:
 
     def send_reliable_message(self, server_url: str, token: str, payload: dict,
                               expected_sender_device_id: str = None) -> Tuple[bool, Any]:
+        payload_dict = payload if isinstance(payload, dict) else {}
+        message_tag = _safe_identifier_tag(payload_dict.get("client_message_id"))
+        sender_tag = _safe_identifier_tag(expected_sender_device_id)
+        recipient_tag = _safe_identifier_tag(payload_dict.get("receiver_device_id"))
+        blob = payload_dict.get("encrypted_blob")
+        signature = payload_dict.get("signature")
+        logger.info("send.http.started mode=reliable delivery_tag=%s sender_tag=%s recipient_tag=%s blob_chars=%d signature_chars=%d",
+                    message_tag, sender_tag, recipient_tag, len(blob) if isinstance(blob, str) else 0,
+                    len(signature) if isinstance(signature, str) else 0)
         url_ok, url_err = validate_server_url(server_url)
         if not url_ok:
+            logger.warning("send.http.rejected reason=invalid_server_url delivery_tag=%s sender_tag=%s recipient_tag=%s",
+                           message_tag, sender_tag, recipient_tag)
             return False, url_err
         url = f"{server_url.rstrip('/')}/messages/send-reliable"
         try:
             response = requests.post(url, json=payload, headers={"Authorization": f"Bearer {token}"}, timeout=10.0, stream=True, allow_redirects=False)
             try:
                 if response.status_code != 200:
+                    logger.warning("send.http.rejected status=%d delivery_tag=%s sender_tag=%s recipient_tag=%s",
+                                   response.status_code, message_tag, sender_tag, recipient_tag)
                     label = "Not Found" if response.status_code == 404 else "отправка не подтверждена"
                     return False, f"HTTP {response.status_code}: {label}"
                 data = _small_response_json(response, MAX_SEND_RESPONSE_BYTES)
                 # A matching UUID alone does not establish that the relay
                 # accepted the queued envelope. Retain it on malformed or
                 # conflicting echoes so a retry never silently drops data.
-                fields = ("encrypted_blob", "signature")
-                if (isinstance(data, dict) and isinstance(payload, dict)
-                        and isinstance(payload.get("client_message_id"), str)
-                        and payload["client_message_id"]
-                        and data.get("id") == payload["client_message_id"]
-                        and all(isinstance(payload.get(key), str) and payload[key]
-                                and data.get(key) == payload[key] for key in fields)
-                        # Updated relays echo the destination. Missing is
-                        # accepted for compatibility with older relays; a
-                        # present but conflicting value must never be ignored.
-                        and ('receiver_device_id' not in data or
-                             (isinstance(payload.get('receiver_device_id'), str)
-                              and payload['receiver_device_id']
-                              and data['receiver_device_id'] == payload['receiver_device_id']))
-                        and (expected_sender_device_id is None or
-                             (isinstance(expected_sender_device_id, str) and expected_sender_device_id
-                              and data.get("sender_device_id") == expected_sender_device_id))):
+                reason = None
+                if not isinstance(data, dict):
+                    reason = "malformed_response"
+                elif not isinstance(payload, dict):
+                    reason = "invalid_local_payload"
+                elif not isinstance(payload.get("client_message_id"), str) or not payload["client_message_id"]:
+                    reason = "missing_client_id"
+                elif data.get("id") != payload["client_message_id"]:
+                    reason = "delivery_id_mismatch"
+                elif any(not isinstance(payload.get(key), str) or not payload[key]
+                         or data.get(key) != payload[key] for key in ("encrypted_blob", "signature")):
+                    reason = "envelope_echo_mismatch"
+                # Updated relays echo the destination. Missing is accepted for
+                # compatibility with older relays; a present conflict is not.
+                elif ("receiver_device_id" in data and
+                      (not isinstance(payload.get("receiver_device_id"), str)
+                       or not payload["receiver_device_id"]
+                       or data["receiver_device_id"] != payload["receiver_device_id"])):
+                    reason = "recipient_echo_mismatch"
+                elif (expected_sender_device_id is not None and
+                      (not isinstance(expected_sender_device_id, str) or not expected_sender_device_id
+                       or data.get("sender_device_id") != expected_sender_device_id)):
+                    reason = "sender_echo_mismatch"
+                if reason is None:
+                    logger.info("send.http.accepted delivery_tag=%s sender_tag=%s recipient_tag=%s",
+                                message_tag, sender_tag, recipient_tag)
                     return True, data
+                logger.warning("send.http.rejected reason=%s delivery_tag=%s sender_tag=%s recipient_tag=%s",
+                               reason, message_tag, sender_tag, recipient_tag)
                 return False, "Сервер вернул неверное подтверждение сообщения"
             finally:
                 response.close()
         except (requests.exceptions.RequestException, ValueError, OSError, TypeError) as e:
+            logger.warning("send.http.failed error_type=%s delivery_tag=%s sender_tag=%s recipient_tag=%s",
+                           type(e).__name__, message_tag, sender_tag, recipient_tag)
             return False, f"Ошибка сети или ответа: {type(e).__name__}"
 
     def upload_file(self, server_url: str, token: str, file_data: bytes) -> Tuple[bool, Any]:

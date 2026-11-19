@@ -1,13 +1,18 @@
 import asyncio
+import logging
 import threading
 import inspect
+import time
 import requests
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QObject, QThread, Signal
 import websockets
 import json
 import re
 from app.client_api import api, _small_response_json, validate_server_url
 from app.delivery import SYNC_PAGE_SIZE, bounded_json_response
+from app.diagnostics import safe_identifier_tag
+
+_logger = logging.getLogger("max1m.delivery")
 
 
 MAX_PENDING_WS_EVENTS = 16
@@ -31,25 +36,65 @@ def _close_response(response) -> None:
 # AUTH WORKERS
 # ============================================================
 
-class HistoryPageWorker(QThread):
-    """One cancellable history scan.
+class _HistoryPageSignals(QObject):
+    finished = Signal()
 
-    Callers retain the worker until its native finished signal and must reject
-    stale account/chat/revision results before displaying or marking read.
+
+class HistoryPageWorker:
+    """One cancellable history scan, backed by a daemon Python thread.
+
+    This reader deliberately avoids creating another native QThread while the
+    WebSocket and voice workers are active. Its Qt signal bridge is created on
+    the GUI thread and only publishes the completed, sanitized result.
     """
     def __init__(self, owner, chat, offset=0, page_size=25, query=None, *, load_fn=None):
-        super().__init__()
         self.owner, self.chat = owner, chat
         self.offset, self.page_size, self.query = offset, page_size, query
         self._cancelled = threading.Event()
         self._load_fn = load_fn
+        self._signals = _HistoryPageSignals()
+        self.finished = self._signals.finished
+        self._thread = None
+        self._thread_lock = threading.Lock()
         self.result = None
 
     def cancel(self):
         self._cancelled.set()
 
+    def start(self):
+        with self._thread_lock:
+            if self._thread is not None:
+                raise RuntimeError("HistoryPageWorker can only be started once")
+            thread = threading.Thread(
+                target=self.run,
+                name="Max1mHistoryReader",
+                daemon=True,
+            )
+            self._thread = thread
+            try:
+                thread.start()
+            except Exception:
+                self._thread = None
+                raise
+
+    def isRunning(self):
+        thread = self._thread
+        return bool(thread is not None and thread.is_alive())
+
+    def wait(self, msecs=-1):
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            return True
+        if thread is threading.current_thread():
+            return False
+        timeout = None if msecs is None or msecs < 0 else max(0, msecs) / 1000.0
+        thread.join(timeout)
+        return not thread.is_alive()
+
     def run(self):
         from app.history_paging import HistoryCancelled, check_cancel
+        started_at = time.monotonic()
+        logger = logging.getLogger("max1m.history")
         try:
             check_cancel(self._cancelled.is_set)
             if self._load_fn is None:
@@ -61,11 +106,22 @@ class HistoryPageWorker(QThread):
                         query=self.query, cancel=self._cancelled.is_set)
             check_cancel(self._cancelled.is_set)
             self.result = ("ok", page)
+            logger.info("history.scan.completed status=ok offset=%d duration_ms=%d",
+                        self.offset, int((time.monotonic() - started_at) * 1000))
         except HistoryCancelled:
             self.result = ("cancelled", None)
+            logger.info("history.scan.completed status=cancelled offset=%d duration_ms=%d",
+                        self.offset, int((time.monotonic() - started_at) * 1000))
         except Exception as exc:
             # Avoid retaining exceptions/tracebacks that may reference plaintext.
             self.result = ("error", type(exc).__name__)
+            logger.warning("history.scan.completed status=error error_type=%s offset=%d",
+                           type(exc).__name__, self.offset)
+        finally:
+            try:
+                self._signals.finished.emit()
+            except RuntimeError:
+                logger.warning("history.scan.signal_emit_failed")
 
 
 class RegisterWorker(QThread):
@@ -106,6 +162,28 @@ class FindUserWorker(QThread):
     def run(self):
         try:
             success, data = api.find_user(self.server_url, self.token, self.target_username)
+        except Exception as exc:
+            success, data = False, f"Ошибка поиска: {type(exc).__name__}"
+        finally:
+            self.token = ""
+        self.finished.emit(success, data)
+
+
+class OnlineDevicesWorker(QThread):
+    finished = Signal(bool, object)
+
+    def __init__(self, server_url: str, token: str, target_username: str):
+        super().__init__()
+        self.server_url = server_url
+        self.token = token
+        self.target_username = target_username
+        self.account_context = None
+
+    def run(self):
+        try:
+            success, data = api.get_online_devices(self.server_url, self.token, self.target_username)
+        except Exception as exc:
+            success, data = False, f"Ошибка проверки устройств: {type(exc).__name__}"
         finally:
             self.token = ""
         self.finished.emit(success, data)
@@ -286,6 +364,11 @@ class ReliableSendWorker(QThread):
         self.expected_sender_device_id = None
 
     def run(self):
+        payload = self.payload if isinstance(self.payload, dict) else {}
+        message_tag = safe_identifier_tag(payload.get("client_message_id"))
+        recipient_tag = safe_identifier_tag(payload.get("receiver_device_id"))
+        _logger.info("outbox.network.started delivery_tag=%s recipient_tag=%s",
+                     message_tag, recipient_tag)
         try:
             if not self.expected_sender_device_id:
                 raise ValueError("Missing sender device identity")
@@ -295,6 +378,11 @@ class ReliableSendWorker(QThread):
             success, data = False, f"Ошибка обработки ответа: {type(exc).__name__}"
         finally:
             self.token = ""
+        if success:
+            _logger.info("outbox.network.completed result=accepted delivery_tag=%s", message_tag)
+        else:
+            _logger.warning("outbox.network.completed result=rejected reason=%s delivery_tag=%s",
+                            type(data).__name__, message_tag)
         self.finished.emit(success, data)
 
 
@@ -462,7 +550,7 @@ class WebSocketWorker(QThread):
             if self._ws is ws:
                 await ws.send(serialized)
         except Exception as e:
-            print(f"[WS] Ошибка отправки: {type(e).__name__}")
+            _logger.warning("ws.signal.send_failed error_type=%s", type(e).__name__)
 
     def release_event(self):
         """Called exactly once by the GUI after handling a queued WS event."""
@@ -477,6 +565,7 @@ class WebSocketWorker(QThread):
         except asyncio.CancelledError:
             pass
         except Exception as e:
+            _logger.error("ws.worker.failed error_type=%s", type(e).__name__)
             self.ws_error.emit(f"WS FATAL: {type(e).__name__}")
         finally:
             self._token = ""
@@ -491,11 +580,13 @@ class WebSocketWorker(QThread):
     async def _connect_loop(self):
         backoff = 1.0
         max_backoff = 30.0
+        backpressure_reported = False
 
         while self._is_running:
             auth_suspect = False
             try:
                 self.connection_status.emit("reconnecting")
+                _logger.info("ws.connecting")
                 # websockets renamed extra_headers in v14. Both variants put
                 # the credential in the handshake header, never the URL.
                 header_arg = ("additional_headers" if "additional_headers" in
@@ -518,7 +609,7 @@ class WebSocketWorker(QThread):
                     self._ws = ws
                     backoff = 1.0
                     self.connection_status.emit("connected")
-                    print("[WS] Подключено")  # Never log the token-bearing URL.
+                    _logger.info("ws.connected device_tag=%s", safe_identifier_tag(self.device_id))
 
                     event_signals = {
                         "new_message": self.new_message_received,
@@ -540,23 +631,45 @@ class WebSocketWorker(QThread):
                         if not self._event_slots.acquire(blocking=False):
                             # Stop reading until the GUI consumes an event; the
                             # WebSocket library and TCP apply backpressure.
+                            if not backpressure_reported:
+                                _logger.warning("ws.receive.paused reason=gui_event_queue_full")
+                                backpressure_reported = True
                             await asyncio.sleep(0.02)
                             continue
+                        backpressure_reported = False
                         emitted = False
                         try:
                             message = await ws.recv()
                             if isinstance(message, bytes):
+                                _logger.warning("ws.event.rejected reason=unsupported_binary")
                                 continue  # Legacy screen relay is disabled.
-                            data = json.loads(message)
+                            try:
+                                data = json.loads(message)
+                            except (ValueError, RecursionError) as exc:
+                                _logger.warning("ws.event.rejected reason=invalid_json error_type=%s",
+                                                type(exc).__name__)
+                                continue
                             if not isinstance(data, dict):
+                                _logger.warning("ws.event.rejected reason=invalid_shape")
                                 continue
                             msg_type = data.get("type")
                             if not isinstance(msg_type, str):
+                                _logger.warning("ws.event.rejected reason=missing_event_type")
                                 continue
                             signal = event_signals.get(msg_type)
                             if signal is not None:
+                                if msg_type == "new_message":
+                                    blob = data.get("encrypted_blob")
+                                    _logger.info(
+                                        "ws.message.received delivery_tag=%s sender_tag=%s blob_chars=%d",
+                                        safe_identifier_tag(data.get("id") or data.get("message_id")),
+                                        safe_identifier_tag(data.get("sender_device_id")),
+                                        len(blob) if isinstance(blob, str) else 0,
+                                    )
                                 signal.emit(data)
                                 emitted = True  # GUI callback returns the slot.
+                            else:
+                                _logger.debug("ws.event.ignored reason=unsupported_type")
                         finally:
                             if not emitted:
                                 self._event_slots.release()
@@ -568,7 +681,9 @@ class WebSocketWorker(QThread):
                 if code == 1008:
                     auth_suspect = True
                 # Close reasons are peer-controlled and may contain secrets.
-                print(f"[WS] Соединение закрыто: code={code} class={type(e).__name__}")
+                _logger.warning("ws.disconnected close_code=%s error_type=%s auth_suspect=%s",
+                                code if isinstance(code, int) else "unknown",
+                                type(e).__name__, auth_suspect)
             except Exception as e:
                 status_code = getattr(e, "status_code", None)
                 if status_code is None:
@@ -576,7 +691,9 @@ class WebSocketWorker(QThread):
                 if status_code in (401, 403):
                     auth_suspect = True
                 # Exception strings/tracebacks can contain URLs or headers.
-                print(f"[WS] Ошибка: {type(e).__name__}")
+                _logger.warning("ws.connection.failed error_type=%s http_status=%s auth_suspect=%s",
+                                type(e).__name__, status_code if isinstance(status_code, int) else "unknown",
+                                auth_suspect)
             finally:
                 self._ws = None
 
@@ -587,7 +704,8 @@ class WebSocketWorker(QThread):
             if auth_suspect:
                 self.connection_status.emit("auth_check")
                 backoff = max(backoff, 5.0)
-            print(f"[WS] Реконнект через {backoff:.1f}s...")
+            _logger.info("ws.reconnect.scheduled delay_seconds=%.1f auth_suspect=%s",
+                         backoff, auth_suspect)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
 
@@ -621,6 +739,8 @@ class SyncMessagesWorker(QThread):
         params = {"limit": SYNC_PAGE_SIZE}
         if self.after:
             params["after"] = self.after
+        cursor_tag = safe_identifier_tag(self.after)
+        _logger.info("sync.request.started after_tag=%s page_size=%d", cursor_tag, SYNC_PAGE_SIZE)
         try:
             response = requests.get(url, headers=headers, params=params, timeout=15.0, stream=True, allow_redirects=False)
             try:
@@ -628,13 +748,23 @@ class SyncMessagesWorker(QThread):
                     data = bounded_json_response(response)
                     if not isinstance(data, list) or len(data) > SYNC_PAGE_SIZE:
                         raise ValueError("Invalid sync response")
+                    delivery_tags = ",".join(
+                        safe_identifier_tag(item.get("id"))
+                        for item in data if isinstance(item, dict)
+                    )
+                    _logger.info("sync.response.parsed count=%d after_tag=%s delivery_tags=%s",
+                                 len(data), cursor_tag, delivery_tags or "-")
                     result = (True, data)
                 else:
                     # Do not buffer or display an unbounded error body.
+                    _logger.warning("sync.response.rejected status=%d after_tag=%s",
+                                    response.status_code, cursor_tag)
                     result = (False, f"HTTP {response.status_code}: sync failed")
             finally:
                 response.close()
         except Exception as e:
+            _logger.warning("sync.request.failed error_type=%s after_tag=%s",
+                            type(e).__name__, cursor_tag)
             result = (False, f"Ошибка синхронизации: {type(e).__name__}")
         finally:
             self.token = ""
@@ -651,6 +781,11 @@ class AcknowledgeMessagesWorker(QThread):
         self.message_ids = message_ids
 
     def run(self):
+        delivery_tags = ",".join(safe_identifier_tag(item) for item in self.message_ids
+                                  if isinstance(item, str))
+        _logger.info("ack.request.started count=%d delivery_tags=%s",
+                     len(self.message_ids) if isinstance(self.message_ids, list) else 0,
+                     delivery_tags or "-")
         try:
             if (not isinstance(self.message_ids, list) or not 1 <= len(self.message_ids) <= SYNC_PAGE_SIZE
                     or any(not isinstance(mid, str) or not 0 < len(mid) <= 64 for mid in self.message_ids)
@@ -670,9 +805,13 @@ class AcknowledgeMessagesWorker(QThread):
                 else:
                     # Avoid consuming or logging untrusted error bodies.
                     result = (False, response.status_code)
+                _logger.info("ack.response.completed status=%d accepted=%s delivery_tags=%s",
+                             response.status_code, result[0], delivery_tags or "-")
             finally:
                 response.close()
         except Exception as e:
+            _logger.warning("ack.request.failed error_type=%s delivery_tags=%s",
+                            type(e).__name__, delivery_tags or "-")
             result = (False, type(e).__name__)
         finally:
             self.token = ""

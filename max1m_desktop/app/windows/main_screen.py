@@ -37,8 +37,14 @@ from app import outbox, attachment_outbox
 from app.outbox_policy import verify_queued_recipient, OutboxRecipientError
 from app.incoming_identity import verify_incoming, IncomingIdentityError
 from app.call_policy import resolve_call_peer, call_context_valid
-from app.contact_keys import fingerprint_public_key, device_key_map, newly_advertised_devices
-from app.recipient_context import RecipientContext, capture_recipient, recipient_still_trusted, recipient_is_verified, verification_scope, is_active_recipient
+from app.contact_keys import (
+    fingerprint_public_key, device_key_map, newly_advertised_devices,
+    add_unverified_sender_device,
+)
+from app.recipient_context import (
+    RecipientContext, capture_recipient, recipient_still_trusted, recipient_is_verified,
+    verification_scope, is_active_recipient, choose_online_device,
+)
 from app.state import state
 from app.crypto_box import crypto
 from app.group_crypto import (
@@ -48,7 +54,7 @@ from app.group_crypto import (
     store_member_sender_key,
 )
 from app.workers import (
-    FindUserWorker, SendMessageWorker, ReliableSendWorker, ReliableUploadFileWorker, DownloadFileWorker,
+    FindUserWorker, OnlineDevicesWorker, SendMessageWorker, ReliableSendWorker, ReliableUploadFileWorker, DownloadFileWorker,
     CreateGroupWorker, SendGroupMessageWorker, SyncGroupMessagesWorker,
     DistributeGroupSenderKeyWorker, InviteGroupMemberWorker,
     AcknowledgeGroupMessagesWorker, FetchGroupMembersWorker,
@@ -649,9 +655,20 @@ class MainScreen(QFrame):
         # ── Базовое состояние ─────────────────────────────────────
         self.find_worker     = None
         self._net_workers    = []
+        self._contact_presence_worker = None
+        self._contact_presence_pending = False
+        self._contact_presence_known = False
+        self._contact_online_device_ids = set()
+        self._contact_presence_timer = QTimer(self)
+        self._contact_presence_timer.setInterval(20000)
+        self._contact_presence_timer.timeout.connect(self._refresh_current_contact_presence)
+        self._contact_presence_timer.start()
         self._outbox_worker = None
         self._outbox_warning_shown = False
         self._incoming_identity_notice_shown = False
+        self._identity_refresh_workers = {}
+        self._identity_refresh_last_attempt = {}
+        self._identity_refresh_last_global = None
         self._outbox_identity_warning_shown = False
         self._outbox_management_active = False
         self._outbox_skipped = set()
@@ -1204,48 +1221,295 @@ class MainScreen(QFrame):
         self._load_allies_from_storage()
 
     def process_incoming_message(self, data: dict, is_sync: bool = False) -> bool:
-        """Never acknowledge an unknown, unverified or unsaved message."""
+        """Verify, persist, and only then acknowledge a personal delivery."""
+        import logging
+        from app.diagnostics import safe_identifier_tag
+        from app.incoming_identity import delivery_id_from_envelope
+
+        logger = logging.getLogger("max1m.delivery")
+        source = "sync" if is_sync else "websocket"
+        raw_delivery_id = (data.get("id") or data.get("message_id")) if isinstance(data, dict) else None
+        sender_id = data.get("sender_device_id") if isinstance(data, dict) else None
+        delivery_tag = safe_identifier_tag(raw_delivery_id)
+        sender_tag = safe_identifier_tag(sender_id)
+        blob = data.get("encrypted_blob") if isinstance(data, dict) else None
+        blob_chars = len(blob) if isinstance(blob, str) else 0
+        logger.info("incoming.received source=%s delivery_tag=%s sender_tag=%s blob_chars=%d",
+                    source, delivery_tag, sender_tag, blob_chars)
+
         account = (state.username, state.server_url, state.device_id, getattr(state, "token", None))
         try:
             owner_key = crypto.get_public_key_b64()
             context, decrypted = verify_incoming(state, crypto, data)
-        except IncomingIdentityError:
+            delivery_id = delivery_id_from_envelope(data)
+            if isinstance(data, dict) and delivery_id is not None and data.get("id") is None:
+                # Live notifications historically use `message_id`; normalize
+                # it so persistence markers and ACK diagnostics share sync IDs.
+                data = {**data, "id": delivery_id}
+                delivery_tag = safe_identifier_tag(delivery_id)
+        except IncomingIdentityError as exc:
+            reason = getattr(exc, "reason", "identity_verification_failed")
+            sender_tag = getattr(exc, "sender_tag", None) or sender_tag
+            match_count = getattr(exc, "match_count", None)
+            logger.warning(
+                "incoming.reject stage=identity source=%s reason=%s delivery_tag=%s sender_tag=%s matches=%s",
+                source, reason, delivery_tag, sender_tag,
+                match_count if match_count is not None else "unknown",
+            )
+            if reason == "unknown_sender_device":
+                refresh = getattr(self, "_queue_sender_directory_refresh", None)
+                if callable(refresh):
+                    refresh(data, exc)
             if not self._incoming_identity_notice_shown:
                 self._incoming_identity_notice_shown = True
                 window = self.window()
                 if hasattr(window, "show_notification"):
-                    window.show_notification("Проверка устройств", "Некоторые входящие сообщения ожидают проверки ключа или не прошли проверку. Они не подтверждены серверу.")
+                    window.show_notification(
+                        "Проверка устройств",
+                        "Некоторые входящие сообщения ожидают проверки ключа или не прошли проверку. Они не подтверждены серверу.",
+                    )
             return False
         except Exception as exc:
-            print(f"[PROCESS] Не удалось проверить локальный ключ: {type(exc).__name__}")
+            logger.warning(
+                "incoming.reject stage=identity reason=local_identity_error error_type=%s delivery_tag=%s sender_tag=%s",
+                type(exc).__name__, delivery_tag, sender_tag,
+            )
             return False
+
+        logger.info("incoming.identity.accepted source=%s delivery_tag=%s sender_tag=%s",
+                    source, delivery_tag, sender_tag)
         try:
-            from app.recipient_context import recipient_is_verified
+            from app.recipient_context import (
+                recipient_is_verified,
+                recipient_local_entry_is_verified,
+            )
+
             def context_valid():
-                return (account == (state.username, state.server_url, state.device_id, getattr(state, "token", None))
-                        and crypto.get_public_key_b64() == owner_key
-                        and recipient_is_verified(state, context))
+                if (account != (state.username, state.server_url, state.device_id, getattr(state, "token", None))
+                        or crypto.get_public_key_b64() != owner_key):
+                    return False
+                if recipient_is_verified(state, context):
+                    return True
+                # An ambiguous device ID was resolved only by matching this
+                # locally saved and verified contact; the relay hint is not trust.
+                hint_user_id = data.get("sender_user_id") if isinstance(data, dict) else None
+                return recipient_local_entry_is_verified(
+                    state, context, expected_user_id=hint_user_id
+                )
+
             if not context_valid():
+                logger.warning("incoming.reject stage=session_guard reason=account_or_identity_changed delivery_tag=%s",
+                               delivery_tag)
                 return False
-            if not self._handle_decrypted_payload(context.username, decrypted, data["signature"], is_sync,
-                                                  session_guard=context_valid, sender_context=context,
-                                                  account_context=account):
+            progress = {"stage": "payload_dispatch", "persisted": False}
+            safe_stages = {
+                "payload_decode", "payload_validation", "session_guard", "history_persist",
+                "history_persisted", "read_receipt_persist", "message_delete_persist",
+                "message_edit_persist", "pin_persist", "state_persisted", "ui_update",
+                "ratchet_persist_marker", "ratchet_persist_marker_written", "event_emit",
+            }
+
+            def record_progress(stage, *, persisted=False):
+                if isinstance(stage, str) and stage in safe_stages:
+                    progress["stage"] = stage
+                if persisted is True:
+                    progress["persisted"] = True
+
+            try:
+                accepted = self._handle_decrypted_payload(
+                    context.username, decrypted, data["signature"], is_sync,
+                    session_guard=context_valid, sender_context=context,
+                    account_context=account, diagnostic_stage=record_progress,
+                )
+            except Exception as exc:
+                if progress["persisted"]:
+                    # Durable history wins over a later presentation failure;
+                    # do not make a stored message retry forever due to UI work.
+                    logger.error("incoming.post_persist.failed stage=%s error_type=%s delivery_tag=%s",
+                                 progress["stage"], type(exc).__name__, delivery_tag)
+                    accepted = True
+                else:
+                    logger.warning("incoming.reject stage=%s reason=payload_processing_failed error_type=%s delivery_tag=%s",
+                                   progress["stage"], type(exc).__name__, delivery_tag)
+                    return False
+            if not accepted:
+                logger.warning("incoming.reject stage=%s reason=payload_rejected delivery_tag=%s",
+                               progress["stage"], delivery_tag)
                 return False
+            if progress["persisted"]:
+                logger.info("incoming.history.persisted result=stored_or_duplicate delivery_tag=%s",
+                            delivery_tag)
             if not context_valid():
+                logger.warning("incoming.reject stage=session_guard reason=account_or_identity_changed delivery_tag=%s",
+                               delivery_tag)
                 return False
+
             raw_blob = data.get("encrypted_blob") if isinstance(data, dict) else None
-            srv_id = data.get("id") if isinstance(data, dict) else None
-            if isinstance(raw_blob, str) and raw_blob.startswith("TTFEUjAx") and isinstance(srv_id, str) and srv_id:
+            srv_id = delivery_id_from_envelope(data)
+            if isinstance(raw_blob, str) and raw_blob.startswith("TTFEUjAx") and srv_id:
+                progress["stage"] = "ratchet_persist_marker"
                 try:
                     from app.double_ratchet import RatchetStore
                     RatchetStore(state.username).mark_delivery_persisted(srv_id)
-                except Exception:
-                    pass
-            self.incoming_message_processed.emit(data)
+                    progress["stage"] = "ratchet_persist_marker_written"
+                    logger.info("incoming.ratchet.persist_marker_written delivery_tag=%s", delivery_tag)
+                except Exception as exc:
+                    # History is already durable. Report marker failure but do
+                    # not reject or lose the stored message on the server.
+                    logger.error("incoming.ratchet.persist_marker_failed error_type=%s delivery_tag=%s",
+                                 type(exc).__name__, delivery_tag)
+
+            progress["stage"] = "event_emit"
+            try:
+                self.incoming_message_processed.emit(data)
+            except Exception as exc:
+                # Rendering/subscribers are not part of durability or ACK.
+                logger.warning("incoming.event_emit.failed error_type=%s delivery_tag=%s",
+                               type(exc).__name__, delivery_tag)
+            logger.info("incoming.accept source=%s delivery_tag=%s sender_tag=%s",
+                        source, delivery_tag, sender_tag)
             return True
-        except Exception as e:
-            print(f"[PROCESS] Ошибка сохранения или обработки: {type(e).__name__}")
+        except Exception as exc:
+            progress = locals().get("progress", {})
+            stage = progress.get("stage", "incoming_processing") if isinstance(progress, dict) else "incoming_processing"
+            logger.warning("incoming.process_failed stage=%s error_type=%s delivery_tag=%s",
+                           stage, type(exc).__name__, delivery_tag)
             return False
+
+    def _queue_sender_directory_refresh(self, envelope: dict, identity_error):
+        """Refresh a known contact's directory after an unknown-device message.
+
+        Any discovered device is saved only as an unverified candidate. The
+        triggering delivery remains unacknowledged until the user verifies it.
+        """
+        import logging
+        logger = logging.getLogger("max1m.identity")
+        if not isinstance(envelope, dict):
+            return
+        username = envelope.get("sender_username")
+        user_id = envelope.get("sender_user_id")
+        sender_device_id = envelope.get("sender_device_id")
+        sender_tag = getattr(identity_error, "sender_tag", None) or "-"
+        if (not isinstance(username, str) or not username
+                or not isinstance(user_id, str) or not user_id
+                or not isinstance(sender_device_id, str) or not sender_device_id):
+            logger.info("identity.directory_refresh.skipped reason=missing_sender_metadata sender_tag=%s", sender_tag)
+            return
+
+        contact = state.allies.get(username) if isinstance(state.allies, dict) else None
+        if not isinstance(contact, dict):
+            logger.info("identity.directory_refresh.skipped reason=contact_not_saved sender_tag=%s", sender_tag)
+            return
+        if contact.get("user_id") != user_id:
+            logger.warning("identity.directory_refresh.skipped reason=account_identity_changed sender_tag=%s", sender_tag)
+            return
+
+        account = (state.username, state.server_url, state.device_id, getattr(state, "token", None))
+        if not all(isinstance(value, str) and value for value in account):
+            return
+        worker_key = (account[0], account[1], account[2], username)
+        workers = getattr(self, "_identity_refresh_workers", None)
+        if not isinstance(workers, dict):
+            workers = self._identity_refresh_workers = {}
+        current_worker = workers.get(worker_key)
+        if current_worker is not None:
+            # A finished worker may still have its queued callback pending.
+            return
+
+        now = time.monotonic()
+        last_attempts = getattr(self, "_identity_refresh_last_attempt", None)
+        if not isinstance(last_attempts, dict):
+            last_attempts = self._identity_refresh_last_attempt = {}
+        if now - last_attempts.get(worker_key, 0.0) < 60.0:
+            return
+        last_global = getattr(self, "_identity_refresh_last_global", None)
+        if isinstance(last_global, (int, float)) and now - last_global < 12.0:
+            return
+
+        worker = FindUserWorker(account[1], account[3], username)
+        worker.account_context = account
+        worker.identity_refresh_key = worker_key
+        worker.identity_refresh_target = (username, user_id, sender_device_id, sender_tag)
+        worker.finished.connect(
+            lambda success, result, w=worker: self._on_sender_directory_refresh_finished(success, result, w),
+            Qt.QueuedConnection,
+        )
+        workers[worker_key] = worker
+        last_attempts[worker_key] = now
+        self._identity_refresh_last_global = now
+        self._net_workers.append(worker)
+        try:
+            worker.start()
+            logger.info("identity.directory_refresh.started sender_tag=%s", sender_tag)
+        except Exception as exc:
+            workers.pop(worker_key, None)
+            if worker in self._net_workers:
+                self._net_workers.remove(worker)
+            logger.warning("identity.directory_refresh.start_failed error_type=%s sender_tag=%s",
+                           type(exc).__name__, sender_tag)
+
+    def _on_sender_directory_refresh_finished(self, success, result, worker):
+        import logging
+        logger = logging.getLogger("max1m.identity")
+        worker_key = getattr(worker, "identity_refresh_key", None)
+        target = getattr(worker, "identity_refresh_target", None)
+        try:
+            worker.wait()
+        except RuntimeError:
+            pass
+        if worker in getattr(self, "_net_workers", []):
+            self._net_workers.remove(worker)
+        workers = getattr(self, "_identity_refresh_workers", {})
+        if isinstance(workers, dict) and workers.get(worker_key) is worker:
+            workers.pop(worker_key, None)
+        if (not isinstance(target, tuple) or len(target) != 4
+                or not isinstance(worker_key, tuple)):
+            logger.warning("identity.directory_refresh.failed reason=invalid_worker_context")
+            return
+
+        username, user_id, sender_device_id, sender_tag = target
+        account = getattr(worker, "account_context", None)
+        current_account = (state.username, state.server_url, state.device_id, getattr(state, "token", None))
+        if account != current_account:
+            logger.info("identity.directory_refresh.discarded reason=session_changed sender_tag=%s", sender_tag)
+            return
+        if not success or not isinstance(result, dict):
+            logger.warning("identity.directory_refresh.failed reason=lookup_failed sender_tag=%s", sender_tag)
+            return
+
+        contact = state.allies.get(username) if isinstance(state.allies, dict) else None
+        if (not isinstance(contact, dict) or contact.get("user_id") != user_id
+                or result.get("username") != username or result.get("user_id") != user_id):
+            logger.warning("identity.directory_refresh.failed reason=contact_identity_changed sender_tag=%s", sender_tag)
+            return
+        try:
+            advertised_ids = device_key_map(result)
+            if sender_device_id not in advertised_ids:
+                logger.warning("identity.directory_refresh.failed reason=sender_not_in_directory sender_tag=%s",
+                               sender_tag)
+                return
+            additions = newly_advertised_devices(contact, result, state.allies, username)
+            if not additions:
+                logger.info("identity.directory_refresh.completed status=no_new_devices sender_tag=%s", sender_tag)
+                return
+            updated_contact = {**contact, "devices": [*contact["devices"], *additions]}
+            updated_allies = {**state.allies, username: updated_contact}
+            storage.save_allies(state.username, updated_allies)
+        except Exception as exc:
+            logger.warning("identity.directory_refresh.failed reason=unsafe_directory_update error_type=%s sender_tag=%s",
+                           type(exc).__name__, sender_tag)
+            return
+
+        state.allies = updated_allies
+        self._update_contact_identity_status()
+        logger.info("identity.directory_refresh.completed status=added_unverified device_count=%d sender_tag=%s",
+                    len(additions), sender_tag)
+        window = self.window()
+        if hasattr(window, "show_notification"):
+            window.show_notification(
+                f"@{username}",
+                "Добавлено новое устройство без доверия. Сверьте его ключ через меню чата; сообщения пока остаются на сервере.",
+            )
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1307,7 +1571,14 @@ class MainScreen(QFrame):
 
     def _handle_decrypted_payload(self, sender_username: str, decrypted_text: str,
                                    signature: str, is_sync: bool = False, *,
-                                   session_guard=None, sender_context=None, account_context=None):
+                                   session_guard=None, sender_context=None, account_context=None,
+                                   diagnostic_stage=None):
+        def set_diagnostic_stage(stage, persisted=False):
+            if callable(diagnostic_stage):
+                diagnostic_stage(stage, persisted=persisted)
+
+        set_diagnostic_stage("payload_decode")
+
         def current_session():
             return session_guard is None or session_guard()
 
@@ -1319,8 +1590,10 @@ class MainScreen(QFrame):
                                              account_context=account_context)
 
         if not current_session():
+            set_diagnostic_stage("session_guard")
             return False
         if not isinstance(decrypted_text, str) or len(decrypted_text) > 1024 * 1024:
+            set_diagnostic_stage("payload_validation")
             return False
         def _reject_non_finite_constant(constant):
             raise ValueError(constant)
@@ -1331,8 +1604,10 @@ class MainScreen(QFrame):
                 return False
             payload = {"type": "text", "text": decrypted_text, "msg_id": signature}
         except (ValueError, RecursionError):
+            set_diagnostic_stage("payload_decode")
             return False
 
+        set_diagnostic_stage("payload_validation")
         if not isinstance(payload, dict):
             return False
         _depth_stack = [(payload, 0)]
@@ -1406,9 +1681,13 @@ class MainScreen(QFrame):
             if (not isinstance(ack_ids, list) or len(ack_ids) > MAX_READ_ACK_IDS
                     or any(not isinstance(item, str) or not item or len(item) > 256 for item in ack_ids)):
                 return False
+            set_diagnostic_stage("read_receipt_persist")
             changed = storage.mark_messages_as_read(state.username, sender_username, ack_ids, only_mine=True)
+            set_diagnostic_stage("state_persisted", persisted=True)
             if not current_session():
+                set_diagnostic_stage("session_guard")
                 return False
+            set_diagnostic_stage("ui_update", persisted=True)
             if changed:
                 if state.current_chat_username == sender_username:
                     for i in range(self.messages_layout.count() - 1):
@@ -1423,10 +1702,14 @@ class MainScreen(QFrame):
             if not isinstance(deleted_msg_id, str) or not deleted_msg_id or len(deleted_msg_id) > 256:
                 return False
             if deleted_msg_id:
+                set_diagnostic_stage("message_delete_persist")
                 if not storage.delete_incoming_message(state.username, sender_username, deleted_msg_id):
                     return False
+                set_diagnostic_stage("state_persisted", persisted=True)
                 if not current_session():
+                    set_diagnostic_stage("session_guard")
                     return False
+                set_diagnostic_stage("ui_update", persisted=True)
                 voice_cache.delete_group(message_scope(state.username, state.server_url, sender_username, deleted_msg_id))
                 if state.current_chat_username == sender_username:
                     self._render_history_page()
@@ -1444,12 +1727,16 @@ class MainScreen(QFrame):
             ):
                 return False
             edit_fn = getattr(storage, "edit_message", None)
+            set_diagnostic_stage("message_edit_persist")
             if not callable(edit_fn) or not edit_fn(
                 state.username, sender_username, edit_id, new_text, only_incoming=True
             ):
                 return False
+            set_diagnostic_stage("state_persisted", persisted=True)
             if not current_session():
+                set_diagnostic_stage("session_guard")
                 return False
+            set_diagnostic_stage("ui_update", persisted=True)
             if state.current_chat_username == sender_username and hasattr(self, "_render_history_page"):
                 self._render_history_page()
             return True
@@ -1460,9 +1747,14 @@ class MainScreen(QFrame):
             if not isinstance(pin_id, str) or len(pin_id) > 256 or not isinstance(pin_preview, str) or len(pin_preview) > 1024:
                 return False
             set_pin_fn = getattr(storage, "set_pinned_message", None)
-            if callable(set_pin_fn):
-                pin_obj = {"msg_id": pin_id, "preview": pin_preview} if pin_id else None
-                set_pin_fn(state.username, sender_username, pin_obj)
+            set_diagnostic_stage("pin_persist")
+            if not callable(set_pin_fn):
+                return False
+            pin_obj = {"msg_id": pin_id, "preview": pin_preview} if pin_id else None
+            if not set_pin_fn(state.username, sender_username, pin_obj):
+                return False
+            set_diagnostic_stage("state_persisted", persisted=True)
+            set_diagnostic_stage("ui_update", persisted=True)
             if state.current_chat_username == sender_username and hasattr(self, "_refresh_pinned_banner"):
                 self._refresh_pinned_banner()
             return True
@@ -1489,6 +1781,7 @@ class MainScreen(QFrame):
             reply_to_text   = reply_to.get("text")     if reply_to else None
             reply_to_sender = reply_to.get("sender")   if reply_to else None
 
+            set_diagnostic_stage("history_persist")
             is_new = storage.save_message(
                 state.username, sender_username, text,
                 is_mine=False, msg_id=msg_id, is_read=is_read_now,
@@ -1497,8 +1790,11 @@ class MainScreen(QFrame):
                 reply_to_sender=reply_to_sender,
                 **extra_ttl_kw,
             )
+            set_diagnostic_stage("history_persisted", persisted=True)
             if not current_session():
+                set_diagnostic_stage("session_guard")
                 return False
+            set_diagnostic_stage("ui_update", persisted=True)
             if is_new:
                 card = self._get_ally_card(sender_username)
                 if card:
@@ -1553,6 +1849,7 @@ class MainScreen(QFrame):
             reply_to_sender = reply_to.get("sender")  if reply_to else None
 
             special_text = f"[IMAGE_META]|{file_id}|{secret_key}|{caption}"
+            set_diagnostic_stage("history_persist")
             is_new = storage.save_message(
                 state.username, sender_username, special_text,
                 is_mine=False, msg_id=msg_id, is_read=is_read_now,
@@ -1561,8 +1858,11 @@ class MainScreen(QFrame):
                 reply_to_sender=reply_to_sender,
                 **extra_ttl_kw,
             )
+            set_diagnostic_stage("history_persisted", persisted=True)
             if not current_session():
+                set_diagnostic_stage("session_guard")
                 return False
+            set_diagnostic_stage("ui_update", persisted=True)
             if is_new:
                 card = self._get_ally_card(sender_username)
                 if card:
@@ -1621,6 +1921,7 @@ class MainScreen(QFrame):
             reply_to_sender = reply_to.get("sender")  if reply_to else None
 
             special_text = f"[VOICE_META]|{file_id}|{secret_key}|{duration:.1f}"
+            set_diagnostic_stage("history_persist")
             is_new = storage.save_message(
                 state.username, sender_username, special_text,
                 is_mine=False, msg_id=msg_id, is_read=is_read_now,
@@ -1629,8 +1930,11 @@ class MainScreen(QFrame):
                 reply_to_sender=reply_to_sender,
                 **extra_ttl_kw,
             )
+            set_diagnostic_stage("history_persisted", persisted=True)
             if not current_session():
+                set_diagnostic_stage("session_guard")
                 return False
+            set_diagnostic_stage("ui_update", persisted=True)
             if is_new:
                 card = self._get_ally_card(sender_username)
                 if card:
@@ -1686,6 +1990,7 @@ class MainScreen(QFrame):
             reply_to_text   = reply_to.get("text")    if reply_to else None
             reply_to_sender = reply_to.get("sender")  if reply_to else None
 
+            set_diagnostic_stage("history_persist")
             is_new = storage.save_message(
                 state.username, sender_username, special_text,
                 is_mine=False, msg_id=msg_id, is_read=is_read_now,
@@ -1694,8 +1999,11 @@ class MainScreen(QFrame):
                 reply_to_sender=reply_to_sender,
                 **extra_ttl_kw,
             )
+            set_diagnostic_stage("history_persisted", persisted=True)
             if not current_session():
+                set_diagnostic_stage("session_guard")
                 return False
+            set_diagnostic_stage("ui_update", persisted=True)
             if is_new:
                 card = self._get_ally_card(sender_username)
                 if card:
@@ -1964,7 +2272,8 @@ class MainScreen(QFrame):
                     raise ValueError("Device belongs to another contact")
                 # Verification is a local user decision, never a server claim.
                 data = {**data, "devices": [
-                    {key: value for key, value in device.items() if key not in {"verified_fingerprint", "verified_scope"}}
+                    {key: value for key, value in device.items()
+                     if key not in {"verified_fingerprint", "verified_scope"}}
                     for device in data["devices"]
                 ]}
                 state.allies[ally_username] = data
@@ -2138,18 +2447,28 @@ class MainScreen(QFrame):
             self.identity_status.setVisible(False)
             return
         name = state.current_chat_username
-        devices = state.allies.get(name, {}).get("devices", [])
+        contacts = getattr(state, "allies", {})
+        contact = contacts.get(name, {}) if isinstance(contacts, dict) else {}
+        raw_devices = contact.get("devices", []) if isinstance(contact, dict) else []
+        devices = [device for device in raw_devices if isinstance(device, dict)] if isinstance(raw_devices, list) else []
         verified = 0
         active_id = getattr(state, "current_chat_device_id", None)
         active_name = None
         active_verified = False
         active_context = None
         srv = (getattr(state, "server_url", "") or "").rstrip("/")
+        owner = getattr(state, "username", None)
+        owner_device = getattr(state, "device_id", None)
         for device in devices:
             dev_id = device.get("device_id")
-            context = RecipientContext(name, dev_id, device.get("public_key"),
-                                       state.username, state.device_id, srv)
-            is_ver = recipient_is_verified(state, context)
+            public_key = device.get("public_key")
+            if not isinstance(dev_id, str) or not isinstance(public_key, str):
+                continue
+            context = RecipientContext(name, dev_id, public_key, owner, owner_device, srv)
+            try:
+                is_ver = recipient_is_verified(state, context)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                is_ver = False
             if is_ver:
                 verified += 1
             if (active_id and dev_id == active_id) or (not active_id and active_context is None and is_ver):
@@ -2160,6 +2479,11 @@ class MainScreen(QFrame):
         if len(devices) > 1 and active_name:
             badge = "проверено" if active_verified else "не проверено"
             status_text = f"{status_text} • Активно: {active_name} ({badge})"
+        if (getattr(self, "_contact_presence_known", False)
+                and state.current_chat_username == name):
+            online_ids = getattr(self, "_contact_online_device_ids", set())
+            online_ids = online_ids if isinstance(online_ids, (set, list, tuple)) else set()
+            status_text += " • выбранное устройство подключено" if active_id in online_ids else " • выбранное устройство не подключено"
         if active_verified and active_context is not None:
             try:
                 from app.double_ratchet import RatchetStore
@@ -2173,10 +2497,16 @@ class MainScreen(QFrame):
         self.identity_status.setVisible(True)
 
     def _on_group_selected(self, item):
-        group_id = item.data(Qt.UserRole)
-        group_data = state.groups.get(group_id)
-        if not group_data:
+        group_id = item.data(Qt.UserRole) if item is not None else None
+        if not isinstance(group_id, str) or not group_id:
             return
+        group_data = state.groups.get(group_id) if isinstance(state.groups, dict) else None
+        if not isinstance(group_data, dict):
+            return
+        group_name = group_data.get("name")
+        if not isinstance(group_name, str) or not group_name.strip():
+            group_name = f"Группа {group_id[:8]}"
+            group_data["name"] = group_name
 
         state.current_chat_type = "group"
         state.current_group_id = group_id
@@ -2188,7 +2518,7 @@ class MainScreen(QFrame):
             card.reset_unread()
 
         is_archived = bool(group_data.get("archived"))
-        self.chat_title.setText(group_data["name"] + (" (неактивна)" if is_archived else ""))
+        self.chat_title.setText(group_name + (" (неактивна)" if is_archived else ""))
         self.identity_status.setVisible(False)
         self._set_chat_header_icon("group")
         self.call_btn.setVisible(False)
@@ -2198,9 +2528,15 @@ class MainScreen(QFrame):
         self.chat_menu_btn.setVisible(True)
         self.right_stack.setCurrentWidget(self.chat_area)
         if not is_archived and hasattr(self, "_fetch_group_voice_state"):
-            self._fetch_group_voice_state(group_id)
+            try:
+                self._fetch_group_voice_state(group_id)
+            except Exception as exc:
+                print(f"[GROUP VOICE] Не удалось запросить состояние: {type(exc).__name__}")
         if hasattr(self, "_refresh_group_voice_bar"):
-            self._refresh_group_voice_bar()
+            try:
+                self._refresh_group_voice_bar()
+            except Exception as exc:
+                print(f"[GROUP VOICE] Не удалось обновить панель группы: {type(exc).__name__}")
         self.msg_input.setEnabled(not is_archived)
         # Group v2 supports E2EE text, images, documents, and voice messages.
         self.attach_btn.setEnabled(GROUP_CHAT_SEND_ENABLED and not is_archived)
@@ -2209,8 +2545,11 @@ class MainScreen(QFrame):
         if is_archived:
             self.msg_input.setPlaceholderText("Группа неактивна — доступна только локальная история")
         elif GROUP_CHAT_SEND_ENABLED:
-            self.ensure_my_group_sender_key(group_id)
-            self.msg_input.setPlaceholderText(f"Сообщение в {group_data['name']} (E2EE)...")
+            try:
+                self.ensure_my_group_sender_key(group_id)
+            except Exception as exc:
+                print(f"[GROUP] Не удалось подготовить ключ при открытии чата: {type(exc).__name__}")
+            self.msg_input.setPlaceholderText(f"Сообщение в {group_name} (E2EE)...")
         else:
             self.msg_input.setPlaceholderText("Групповая отправка временно недоступна")
         if not is_archived:
@@ -2218,6 +2557,139 @@ class MainScreen(QFrame):
         self._history_offset = 0
         self._history_query = None
         self._render_history_page()
+
+    def _refresh_current_contact_presence(self):
+        if state.current_chat_type != "ally" or not isinstance(state.current_chat_username, str):
+            return
+        username = state.current_chat_username
+        contacts = getattr(state, "allies", {})
+        if not username or not isinstance(contacts, dict) or not isinstance(contacts.get(username), dict):
+            return
+        account = (state.username, state.server_url, state.device_id, state.token)
+        if not all(isinstance(value, str) and value for value in account):
+            return
+
+        current_worker = getattr(self, "_contact_presence_worker", None)
+        if current_worker is not None:
+            if current_worker.isRunning():
+                if (getattr(current_worker, "target_username", None) != username
+                        or getattr(current_worker, "requested_device_id", None) != state.current_chat_device_id
+                        or getattr(current_worker, "account_context", None) != account):
+                    self._contact_presence_pending = True
+                return
+            # A finished signal can be queued while the GUI timer fires.
+            self._contact_presence_pending = True
+            return
+
+        worker = OnlineDevicesWorker(account[1], account[3], username)
+        worker.account_context = account
+        worker.requested_username = username
+        worker.requested_device_id = state.current_chat_device_id
+        worker.finished.connect(
+            lambda ok, data, w=worker: self._on_contact_presence_received(ok, data, w),
+            Qt.QueuedConnection,
+        )
+        self._contact_presence_worker = worker
+        self._contact_presence_pending = False
+        self._net_workers.append(worker)
+        try:
+            worker.start()
+        except Exception:
+            if worker in self._net_workers:
+                self._net_workers.remove(worker)
+            if self._contact_presence_worker is worker:
+                self._contact_presence_worker = None
+
+    def _on_contact_presence_received(self, success, online_device_ids, worker):
+        try:
+            worker.wait()
+        except RuntimeError:
+            pass
+        if worker in self._net_workers:
+            self._net_workers.remove(worker)
+        if self._contact_presence_worker is worker:
+            self._contact_presence_worker = None
+
+        username = getattr(worker, "requested_username", None)
+        account = (state.username, state.server_url, state.device_id, state.token)
+        still_selected = (
+            getattr(worker, "account_context", None) == account
+            and state.current_chat_type == "ally"
+            and state.current_chat_username == username
+            and state.current_chat_device_id == getattr(worker, "requested_device_id", None)
+        )
+        if still_selected:
+            self._contact_presence_pending = False
+            ally_data = state.allies.get(username)
+            devices = ally_data.get("devices") if isinstance(ally_data, dict) else None
+            if success and isinstance(online_device_ids, list) and isinstance(devices, list):
+                online_ids = {
+                    device_id for device_id in online_device_ids
+                    if isinstance(device_id, str) and 1 <= len(device_id) <= 64
+                }
+                clean_server = (state.server_url or "").rstrip("/")
+                verified_ids = set()
+                for device in devices:
+                    if not isinstance(device, dict):
+                        continue
+                    device_id = device.get("device_id")
+                    public_key = device.get("public_key")
+                    if not isinstance(device_id, str) or not isinstance(public_key, str):
+                        continue
+                    try:
+                        context = RecipientContext(
+                            username, device_id, public_key, state.username,
+                            state.device_id, clean_server,
+                        )
+                        if recipient_is_verified(state, context):
+                            verified_ids.add(device_id)
+                    except Exception:
+                        continue
+
+                self._contact_presence_known = True
+                self._contact_online_device_ids = online_ids
+                selected_device_id = choose_online_device(
+                    devices,
+                    online_ids,
+                    preferred_device_id=worker.requested_device_id,
+                    verified_device_ids=verified_ids,
+                )
+                # Do not retarget a live call. Otherwise, only switch to a device
+                # that is both connected now and verified in this local profile.
+                if not getattr(self, "_active_call_device_id", None):
+                    if selected_device_id:
+                        state.current_chat_device_id = selected_device_id
+                    if hasattr(self, "call_btn"):
+                        self.call_btn.setEnabled(bool(selected_device_id))
+                        if hasattr(self.call_btn, "setToolTip"):
+                            self.call_btn.setToolTip(
+                                "Звонок доступен на подключённом проверенном устройстве"
+                                if selected_device_id else
+                                "Нет подключённого проверенного устройства; сообщение можно поставить в очередь"
+                            )
+            else:
+                # If the endpoint is unavailable (older server/network error),
+                # fall back to the existing trusted-device policy, not stale presence.
+                self._contact_presence_known = False
+                self._contact_online_device_ids = set()
+                if not getattr(self, "_active_call_device_id", None) and hasattr(self, "call_btn"):
+                    self.call_btn.setEnabled(bool(state.current_chat_device_id))
+                    if hasattr(self.call_btn, "setToolTip"):
+                        self.call_btn.setToolTip("Позвонить на выбранное устройство")
+            try:
+                self._update_contact_identity_status()
+            except Exception as exc:
+                print(f"[CONTACT] Не удалось обновить состояние устройств: {type(exc).__name__}")
+        elif state.current_chat_type == "ally" and state.current_chat_username:
+            # The result belongs to an old chat, device, or account. Keep calls
+            # gated until a fresh request for the current context is started.
+            self._contact_presence_pending = True
+
+        if self._contact_presence_pending:
+            if state.current_chat_type == "ally" and state.current_chat_username:
+                QTimer.singleShot(0, self._refresh_current_contact_presence)
+            else:
+                self._contact_presence_pending = False
 
     def _on_ally_selected(self, item):
         selected_username = item.data(Qt.UserRole)
@@ -2231,11 +2703,16 @@ class MainScreen(QFrame):
         state.current_group_id       = None
         state.current_chat_username  = selected_username
         state.current_chat_device_id = target_device_id
+        self._contact_presence_known = False
+        self._contact_online_device_ids = set()
 
         self.chat_title.setText(f"@{selected_username}")
         self._update_contact_identity_status()
         self._set_chat_header_icon("ally")
         self.call_btn.setVisible(has_target)
+        self.call_btn.setEnabled(has_target)
+        if hasattr(self.call_btn, "setToolTip"):
+            self.call_btn.setToolTip("Позвонить на выбранное устройство")
         if hasattr(self, "group_voice_btn"):
             self.group_voice_btn.setVisible(False)
         self.search_btn.setVisible(True)
@@ -2255,6 +2732,9 @@ class MainScreen(QFrame):
         self._history_offset = 0
         self._history_query = None
         self._render_history_page()
+        refresh_presence = getattr(self, "_refresh_current_contact_presence", None)
+        if callable(refresh_presence):
+            refresh_presence()
 
     def open_chat_by_username(self, username: str):
         item = self._get_ally_item(username)
@@ -2478,7 +2958,10 @@ class MainScreen(QFrame):
             QMessageBox.information(self, "Сообщение недоступно", "Не удалось найти сообщение в истории.")
             return
         if status != "ok":
-            print(f"[HISTORY] Не удалось открыть историю: {result}")
+            import logging
+            logging.getLogger("max1m.delivery").warning(
+                "history.page.failed result_type=%s", type(result).__name__
+            )
             label = QLabel("История недоступна. Проверьте хранилище и системный keyring; файлы не удалены.")
             label.setWordWrap(True)
             self.messages_layout.insertWidget(self.messages_layout.count() - 1, label)
@@ -2928,41 +3411,71 @@ class MainScreen(QFrame):
         except Exception as exc:
             print(f"[GROUP] Не удалось загрузить ключи групп: {type(exc).__name__}")
             return
+        if not isinstance(persisted, dict) or not isinstance(state.groups, dict):
+            return
         for gid, gstate in persisted.items():
-            if gid not in state.groups or state.groups[gid].get("archived"):
+            target = state.groups.get(gid)
+            if not isinstance(target, dict) or target.get("archived") or not isinstance(gstate, dict):
                 continue
-            target = state.groups[gid]
-            srv_epoch = int(target.get("epoch", 1) or 1)
-            loc_epoch = int(gstate.get("epoch", 1) or 1)
+            try:
+                srv_epoch = int(target.get("epoch", 1) or 1)
+                loc_epoch = int(gstate.get("epoch", 1) or 1)
+            except (TypeError, ValueError, OverflowError):
+                print("[GROUP] Пропущена запись с некорректной эпохой")
+                continue
+            if srv_epoch < 1 or loc_epoch < 1:
+                print("[GROUP] Пропущена запись с некорректной эпохой")
+                continue
             target["epoch"] = max(srv_epoch, loc_epoch)
             if isinstance(gstate.get("sender_keys"), dict):
                 for sdev, kmap in gstate["sender_keys"].items():
-                    if isinstance(kmap, dict):
+                    if not isinstance(sdev, str) or not isinstance(kmap, dict):
+                        continue
+                    try:
                         if "key_id" in kmap:
                             store_member_sender_key(target, sdev, kmap)
                         else:
                             for _kid, sk_obj in kmap.items():
                                 if isinstance(sk_obj, dict) and "key_id" in sk_obj:
                                     store_member_sender_key(target, sdev, sk_obj)
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        print("[GROUP] Пропущен некорректный ключ участника")
+                        continue
             my_sk = gstate.get("my_sender_key")
-            if isinstance(my_sk, dict) and int(my_sk.get("epoch", 0) or 0) == target["epoch"]:
+            try:
+                my_sk_epoch = int(my_sk.get("epoch", 0) or 0) if isinstance(my_sk, dict) else 0
+                distributed_epoch = int(gstate.get("distributed_epoch", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                my_sk_epoch = 0
+                distributed_epoch = 0
+            if isinstance(my_sk, dict) and my_sk_epoch == target["epoch"]:
                 target["my_sender_key"] = my_sk
-                target["distributed_epoch"] = int(gstate.get("distributed_epoch", 0) or 0)
+                target["distributed_epoch"] = max(0, distributed_epoch)
 
     def _resolve_group_member_pub_and_name(self, group_id: str, device_id: str):
         """Return (public_key, sender_label) for a group member device, failing closed
         if a pinned contact device has a conflicting or ambiguous key."""
+        if not isinstance(group_id, str) or not isinstance(device_id, str):
+            return None, ""
         ally_matches = []
-        for uname, info in state.allies.items():
-            for dev in info.get("devices", []):
-                if dev.get("device_id") == device_id:
+        allies = state.allies if isinstance(state.allies, dict) else {}
+        for uname, info in allies.items():
+            if not isinstance(info, dict):
+                continue
+            devices = info.get("devices", [])
+            if not isinstance(devices, list):
+                continue
+            for dev in devices:
+                if isinstance(dev, dict) and dev.get("device_id") == device_id:
                     ally_matches.append((uname, dev))
         if len(ally_matches) > 1:
             return None, ""
-        group_data = state.groups.get(group_id) or {}
+        group_data = state.groups.get(group_id) if isinstance(state.groups, dict) else None
+        group_data = group_data if isinstance(group_data, dict) else {}
         member_pub = None
         member_label = ""
-        for m in group_data.get("members", []):
+        members = group_data.get("members", [])
+        for m in (members if isinstance(members, list) else []):
             if isinstance(m, dict) and m.get("device_id") == device_id:
                 member_pub = m.get("public_key")
                 member_label = m.get("device_name") or device_id[:8]
@@ -2985,36 +3498,77 @@ class MainScreen(QFrame):
         force_rotate: bool = False,
         target_epoch: int = None,
     ) -> bool:
+        if not isinstance(group_id, str) or not isinstance(state.groups, dict):
+            return False
         group_data = state.groups.get(group_id)
-        if not group_data or group_data.get("archived") or not state.token:
+        if not isinstance(group_data, dict) or group_data.get("archived") or not state.token:
             return False
 
-        epoch = max(1, int(target_epoch or group_data.get("epoch", 1) or 1))
+        raw_epoch = target_epoch if target_epoch is not None else group_data.get("epoch", 1)
+        if isinstance(raw_epoch, bool):
+            print("[GROUP] Некорректная эпоха группы")
+            return False
+        try:
+            epoch = int(raw_epoch or 1)
+        except (TypeError, ValueError, OverflowError):
+            print("[GROUP] Некорректная эпоха группы")
+            return False
+        if not 1 <= epoch <= 2_147_483_647:
+            print("[GROUP] Некорректная эпоха группы")
+            return False
         group_data["epoch"] = epoch
         my_sk = group_data.get("my_sender_key")
+        try:
+            my_epoch = int(my_sk.get("epoch", 0) or 0) if isinstance(my_sk, dict) else 0
+        except (TypeError, ValueError, OverflowError):
+            my_epoch = 0
         need_new = (
             force_rotate
             or not isinstance(my_sk, dict)
-            or int(my_sk.get("epoch", 0) or 0) != epoch
+            or my_epoch != epoch
             or my_sk.get("group_id") not in ("", group_id)
         )
         if need_new:
-            my_sk = group_crypto.generate_sender_key(group_id=group_id, epoch=epoch)
+            try:
+                my_sk = group_crypto.generate_sender_key(group_id=group_id, epoch=epoch)
+            except Exception as exc:
+                print(f"[GROUP] Не удалось создать SenderKey: {type(exc).__name__}")
+                return False
             group_data["my_sender_key"] = my_sk
             group_data["distributed_epoch"] = 0
             self._save_group_keys_safe()
         else:
             my_sk["group_id"] = group_id
 
-        if int(group_data.get("distributed_epoch", 0) or 0) >= epoch and not force_rotate:
+        try:
+            distributed_epoch = int(group_data.get("distributed_epoch", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            distributed_epoch = 0
+        if distributed_epoch >= epoch and not force_rotate:
             return True
 
         members = group_data.get("members") or []
+        if not isinstance(members, list):
+            print("[GROUP] Список участников повреждён; обновляю его с сервера")
+            self._fetch_group_members_and_rotate(group_id, force_rotate=force_rotate, target_epoch=epoch)
+            return False
         other_devs = []
-        for m in members:
-            dev_id = m.get("device_id") if isinstance(m, dict) else (m if isinstance(m, str) else None)
-            if dev_id and dev_id != state.device_id:
+        seen_devices = set()
+        invalid_member = False
+        for member in members:
+            dev_id = member.get("device_id") if isinstance(member, dict) else (
+                member if isinstance(member, str) else None
+            )
+            if (not isinstance(dev_id, str) or not dev_id or len(dev_id) > 64):
+                invalid_member = True
+                continue
+            if dev_id != state.device_id and dev_id not in seen_devices:
+                seen_devices.add(dev_id)
                 other_devs.append(dev_id)
+        if invalid_member:
+            print("[GROUP] Получен неполный список участников; обновляю его с сервера")
+            self._fetch_group_members_and_rotate(group_id, force_rotate=force_rotate, target_epoch=epoch)
+            return False
 
         if not other_devs:
             group_data["distributed_epoch"] = epoch
@@ -3024,18 +3578,22 @@ class MainScreen(QFrame):
         entries = []
         for dev_id in other_devs:
             pub_key, _label = self._resolve_group_member_pub_and_name(group_id, dev_id)
-            if not pub_key:
+            if not isinstance(pub_key, str) or not pub_key:
                 # Member list lacks public_keys (e.g. WS event had IDs only) -> fetch full member info first.
                 self._fetch_group_members_and_rotate(group_id, force_rotate=force_rotate, target_epoch=epoch)
                 return False
-            enc_blob, sig = group_crypto.encrypt_sender_key_for_member(
-                my_sk,
-                pub_key,
-                group_id=group_id,
-                sender_device_id=state.device_id,
-                recipient_device_id=dev_id,
-                group_name=group_data.get("name", ""),
-            )
+            try:
+                enc_blob, sig = group_crypto.encrypt_sender_key_for_member(
+                    my_sk,
+                    pub_key,
+                    group_id=group_id,
+                    sender_device_id=state.device_id,
+                    recipient_device_id=dev_id,
+                    group_name=group_data.get("name", ""),
+                )
+            except Exception as exc:
+                print(f"[GROUP] Не удалось подготовить SenderKey для участника: {type(exc).__name__}")
+                return False
             entries.append(
                 {
                     "sender_device_id": state.device_id,
@@ -3059,7 +3617,13 @@ class MainScreen(QFrame):
             Qt.QueuedConnection,
         )
         self._net_workers.append(worker)
-        worker.start()
+        try:
+            worker.start()
+        except Exception as exc:
+            if worker in self._net_workers:
+                self._net_workers.remove(worker)
+            print(f"[GROUP] Не удалось запустить распространение ключа: {type(exc).__name__}")
+            return False
         return True
 
     def _fetch_group_members_and_rotate(
@@ -3077,7 +3641,12 @@ class MainScreen(QFrame):
             Qt.QueuedConnection,
         )
         self._net_workers.append(worker)
-        worker.start()
+        try:
+            worker.start()
+        except Exception as exc:
+            if worker in self._net_workers:
+                self._net_workers.remove(worker)
+            print(f"[GROUP] Не удалось запустить загрузку участников: {type(exc).__name__}")
 
     def _on_group_members_loaded(self, success: bool, members, group_id: str, worker):
         if worker in self._net_workers:
@@ -3226,14 +3795,25 @@ class MainScreen(QFrame):
         worker.start()
 
     def _on_group_send_finished(self, success: bool, data, worker):
+        import logging
+        import re
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
         if worker in self._net_workers:
             self._net_workers.remove(worker)
-        if not success:
-            print(f"[GROUP] Ошибка отправки: {data}")
-            if isinstance(data, str) and "409" in data:
-                gid = getattr(worker, "group_id", "")
-                if gid:
-                    self._fetch_group_members_and_rotate(gid, force_rotate=True)
+        group_tag = safe_identifier_tag(getattr(worker, "group_id", None))
+        if success:
+            logger.info("group.send.completed result=accepted group_tag=%s", group_tag)
+            return
+        status_match = re.match(r"^HTTP ([0-9]{3}):", data) if isinstance(data, str) else None
+        status_code = int(status_match.group(1)) if status_match else None
+        reason = f"http_{status_code}" if status_code is not None else type(data).__name__
+        logger.warning("group.send.completed result=rejected reason=%s group_tag=%s", reason, group_tag)
+        if status_code == 409:
+            gid = getattr(worker, "group_id", "")
+            if gid:
+                self._fetch_group_members_and_rotate(gid, force_rotate=True)
 
     def _on_attach_file(self):
         is_group = (state.current_chat_type == "group" and bool(state.current_group_id))
@@ -3276,6 +3856,12 @@ class MainScreen(QFrame):
         self._queue_attachment(file_data, context, "image", caption=caption)
 
     def _queue_attachment(self, raw_data, context, kind, caption="", duration=0, filename=""):
+        import logging
+        from app.diagnostics import safe_identifier_tag, safe_message_kind
+
+        logger = logging.getLogger("max1m.delivery")
+        kind_label = safe_message_kind(kind)
+        recipient_tag = safe_identifier_tag(getattr(context, "device_id", None))
         if not is_active_recipient(state, context):
             QMessageBox.warning(self, "Отправка отменена", "Чат или ключ контакта изменился.")
             return
@@ -3284,10 +3870,12 @@ class MainScreen(QFrame):
         if not is_active_recipient(state, context):
             QMessageBox.warning(self, "Отправка отменена", "Чат или ключ контакта изменился во время проверки.")
             return
+        failure_stage = "attachment_metadata"
         try:
             file_id, message_id = str(uuid.uuid4()), str(uuid.uuid4())
             msg_id = f"msg_{uuid.uuid4().hex}"
             secret_key = crypto.generate_file_key()
+            failure_stage = "file_encryption"
             encrypted_file = crypto.encrypt_file(raw_data, secret_key)
             safe_doc_name = ""
             if kind == "image":
@@ -3321,6 +3909,7 @@ class MainScreen(QFrame):
                 import time as _time
                 message["ttl_seconds"] = _ttl_val
                 history["expires_at"] = int(_time.time() + _ttl_val)
+            failure_stage = "message_encryption"
             _enc_att_fn = getattr(self, "_encrypt_attachment_personal", None)
             if callable(_enc_att_fn):
                 encrypted_message = _enc_att_fn(context, message, kind, file_id, secret_key, msg_id)
@@ -3329,16 +3918,24 @@ class MainScreen(QFrame):
             payload = {"receiver_device_id": context.device_id,
                        "encrypted_blob": encrypted_message["encrypted_blob"],
                        "signature": encrypted_message["signature"]}
+            failure_stage = "attachment_queue_enqueue"
             attachment_outbox.enqueue(context, encrypted_file, file_id, message_id, payload, history)
         except Exception as e:
-            print(f"[ATTACHMENT] Не удалось создать очередь: {type(e).__name__}")
+            logger.error(
+                "attachment.prepare.failed stage=%s error_type=%s kind=%s recipient_tag=%s",
+                failure_stage, type(e).__name__, kind_label, recipient_tag,
+            )
             QMessageBox.warning(self, "Вложение не отправлено", "Не удалось сохранить вложение в очередь.")
             return
+        logger.info("attachment.outbox.enqueue.completed delivery_tag=%s attachment_tag=%s kind=%s recipient_tag=%s",
+                    safe_identifier_tag(message_id), safe_identifier_tag(file_id), kind_label, recipient_tag)
         # The attachment is now durable; never tell the user to resend it on a
         # subsequent history or network error (that would create duplicates).
         try:
             outbox.prepare_network_payload(context.owner_username, {"_local_history": history})
-        except Exception:
+        except Exception as exc:
+            logger.error("attachment.local_restore.failed error_type=%s delivery_tag=%s",
+                         type(exc).__name__, safe_identifier_tag(message_id))
             QMessageBox.warning(self, "Вложение в очереди", "История временно недоступна; отправка повторится после восстановления хранилища.")
             return
         if is_active_recipient(state, context) and not self._return_to_latest_for_send():
@@ -3365,14 +3962,25 @@ class MainScreen(QFrame):
                 card.update_preview(f"Документ: {safe_doc_name}")
             else:
                 card.update_preview("Фото" if kind == "image" else "Голосовое")
-        self._try_attachment_outbox()
+        try:
+            self._try_attachment_outbox()
+        except Exception as exc:
+            logger.error("attachment.outbox.schedule_failed error_type=%s delivery_tag=%s",
+                         type(exc).__name__, safe_identifier_tag(message_id))
 
     def _try_attachment_outbox(self):
+        import logging
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
         if not state.username or not state.device_id or not state.server_url or not state.token:
             return
         if self._attachment_worker is not None or self._outbox_management_active:
             return
         account = (state.username, state.server_url, state.device_id, state.token)
+        failure_stage = "queue_read"
+        attachment_tag = "-"
+        recipient_tag = "-"
         try:
             now = time.monotonic()
             self._attachment_retry_after = {name: deadline for name, deadline in self._attachment_retry_after.items()
@@ -3385,12 +3993,19 @@ class MainScreen(QFrame):
             if account != (state.username, state.server_url, state.device_id, state.token):
                 return
             path, blob_path, job = item
+            attachment_tag = safe_identifier_tag(job.get("message_id"))
+            context_data = job.get("context") if isinstance(job, dict) else None
+            recipient_tag = safe_identifier_tag(context_data.get("device_id") if isinstance(context_data, dict) else None)
+            logger.info("attachment.outbox.selected delivery_tag=%s recipient_tag=%s retry=true",
+                        attachment_tag, recipient_tag)
+            failure_stage = "recipient_validation"
             context = RecipientContext(**job["context"])
             if not recipient_is_verified(state, context):
                 raise ValueError("Контакт или учётная запись изменились, либо ключ не проверен")
             envelope = {**job["payload"], "_local_history": job["history"]}
             if verify_queued_recipient(state, crypto, envelope, attachment_file_id=job["file_id"]) != context:
                 raise ValueError("Attachment recipient does not match queued envelope")
+            failure_stage = "local_history_restore"
             outbox.prepare_network_payload(context.owner_username, {"_local_history": job["history"]})
             if account != (state.username, state.server_url, state.device_id, state.token):
                 return
@@ -3400,6 +4015,7 @@ class MainScreen(QFrame):
                 raise ValueError("Attachment recipient changed during preparation")
             if account != (state.username, state.server_url, state.device_id, state.token):
                 return
+            failure_stage = "upload_worker_start"
             worker = ReliableUploadFileWorker(context.server_url, account[3], job["file_id"], blob_path,
                                               job["size"], job["sha256"], file_key)
             worker.recipient_context, worker.queue_item, worker.account_context = context, item, account
@@ -3409,6 +4025,8 @@ class MainScreen(QFrame):
                                     Qt.QueuedConnection)
             worker.start()
         except outbox.QueueRecordError as e:
+            logger.error("attachment.outbox.record_rejected reason=unreadable_record record_tag=%s",
+                         safe_identifier_tag(e.path.name))
             self._attachment_skipped.add(e.path.name)
             self._attachment_retry_after[e.path.name] = time.monotonic() + 300
             if not self._attachment_warning_shown:
@@ -3420,7 +4038,8 @@ class MainScreen(QFrame):
                 if worker in self._net_workers:
                     self._net_workers.remove(worker)
                 self._attachment_worker = None
-            print(f"[ATTACHMENT] Очередь ожидает: {type(e).__name__}")
+            logger.warning("attachment.outbox.failed stage=%s error_type=%s delivery_tag=%s recipient_tag=%s",
+                           failure_stage, type(e).__name__, attachment_tag, recipient_tag)
             if 'item' in locals() and item is not None:
                 self._attachment_skipped.add(item[0].name)
                 self._attachment_retry_after[item[0].name] = time.monotonic() + 300
@@ -3431,10 +4050,31 @@ class MainScreen(QFrame):
                 QTimer.singleShot(250, self._try_attachment_outbox)
 
     def _attachment_failure(self, item, detail):
+        import logging
+        import re
+        from app.diagnostics import safe_identifier_tag
+
+        job = item[2] if isinstance(item, tuple) and len(item) > 2 and isinstance(item[2], dict) else {}
+        context = job.get("context") if isinstance(job.get("context"), dict) else {}
+        delivery_tag = safe_identifier_tag(job.get("message_id"))
+        recipient_tag = safe_identifier_tag(context.get("device_id"))
+        if detail == "ATTACHMENT_INVALID":
+            reason = "attachment_invalid"
+        elif detail == "ATTACHMENT_TOO_LARGE":
+            reason = "attachment_too_large"
+        elif isinstance(detail, str) and (match := re.match(r"^HTTP ([0-9]{3}):", detail)):
+            reason = f"http_{match.group(1)}"
+        elif isinstance(detail, str):
+            reason = "server_rejected"
+        else:
+            reason = type(detail).__name__
+        logging.getLogger("max1m.delivery").warning(
+            "attachment.send.retry reason=%s delivery_tag=%s recipient_tag=%s",
+            reason, delivery_tag, recipient_tag,
+        )
         self._attachment_skipped.add(item[0].name)
         # Avoid exhausting the server's per-IP upload limit during an outage.
         self._attachment_retry_after[item[0].name] = time.monotonic() + 300
-        print(f"[ATTACHMENT] Ожидает повтора: {detail}")
         if not self._attachment_warning_shown:
             self._attachment_warning_shown = True
             if detail == "ATTACHMENT_INVALID":
@@ -3589,25 +4229,41 @@ class MainScreen(QFrame):
 
     def _send_system_payload(self, receiver_username: str, payload_dict: dict,
                              context=None, local_history=None, account_context=None):
-        msg_type = payload_dict.get("type")
+        import logging
+        from app.diagnostics import safe_identifier_tag, safe_message_kind
+
+        logger = logging.getLogger("max1m.delivery")
+        msg_type = payload_dict.get("type") if isinstance(payload_dict, dict) else None
+        kind = safe_message_kind(msg_type)
         durable = msg_type in {"text", "image", "voice", "file", "delete_msg", "edit_msg", "pin_msg"}
         ally_data = state.allies.get(receiver_username)
         if not ally_data or not ally_data.get("devices"):
+            logger.warning("send.prepare.rejected reason=recipient_not_found kind=%s", kind)
             if durable:
                 QMessageBox.warning(self, "Сообщение не отправлено", "Не найдено устройство получателя. Проверьте контакт.")
             return False
+        failure_stage = "session_validation"
         try:
             account = (state.username, state.server_url, state.device_id, state.token)
             if (not all(isinstance(value, str) and value for value in account)
                     or (account_context is not None and account_context != account)):
+                logger.warning("send.prepare.rejected reason=session_unavailable kind=%s", kind)
                 return False
             owner_key = crypto.get_public_key_b64()
             context = context or capture_recipient(state)
+            recipient_tag = safe_identifier_tag(context.device_id)
             if context.username != receiver_username or not recipient_is_verified(state, context):
-                raise ValueError("Контакт или учётная запись изменились")
+                logger.warning("send.prepare.rejected reason=recipient_not_verified kind=%s recipient_tag=%s",
+                               kind, recipient_tag)
+                raise ValueError("Контакт, ключ или учётная запись изменились")
             if not durable and sum(isinstance(w, SendMessageWorker) for w in self._net_workers) >= 16:
+                logger.warning("send.prepare.rejected reason=transient_send_limit kind=%s recipient_tag=%s",
+                               kind, recipient_tag)
                 return False
+            logger.info("send.prepare.started durable=%s kind=%s recipient_tag=%s",
+                        durable, kind, recipient_tag)
             device_id, public_key = context.device_id, context.public_key
+            failure_stage = "encryption"
             _enc_dur_fn = getattr(self, "_encrypt_durable_personal", None) if durable else None
             if callable(_enc_dur_fn):
                 encrypted_data = _enc_dur_fn(context, payload_dict, msg_type)
@@ -3615,20 +4271,37 @@ class MainScreen(QFrame):
                 encrypted_data = crypto.encrypt_message(json.dumps(payload_dict, ensure_ascii=False), public_key)
             payload = {"receiver_device_id": device_id, "encrypted_blob": encrypted_data["encrypted_blob"],
                        "signature": encrypted_data["signature"]}
+            failure_stage = "recipient_revalidation"
             if (account != (state.username, state.server_url, state.device_id, state.token)
                     or crypto.get_public_key_b64() != owner_key
                     or not recipient_is_verified(state, context)):
+                logger.warning("send.prepare.rejected reason=session_or_recipient_changed kind=%s recipient_tag=%s",
+                               kind, recipient_tag)
                 return False
             if durable:
-                if len(payload["encrypted_blob"].encode("utf-8")) + len(payload["signature"].encode("utf-8")) > 1024 * 1024:
+                payload_chars = len(payload["encrypted_blob"]) + len(payload["signature"])
+                if payload_chars > 1024 * 1024:
+                    logger.warning("send.prepare.rejected reason=payload_too_large kind=%s chars=%d recipient_tag=%s",
+                                   kind, payload_chars, recipient_tag)
                     QMessageBox.warning(self, "Сообщение слишком большое", "Зашифрованное сообщение превышает лимит сервера 1 MiB.")
                     return False
-                outbox.enqueue(context.owner_username, context.server_url, context.owner_device_id,
-                               payload, local_history=local_history)
+                failure_stage = "outbox_enqueue"
+                client_id = outbox.enqueue(context.owner_username, context.server_url, context.owner_device_id,
+                                           payload, local_history=local_history)
+                logger.info("outbox.enqueue.completed delivery_tag=%s recipient_tag=%s kind=%s",
+                            safe_identifier_tag(client_id), recipient_tag, kind)
                 # History is restored from the encrypted queue before network send.
-                self._try_outbox()
+                failure_stage = "outbox_schedule"
+                try:
+                    self._try_outbox()
+                except Exception as exc:
+                    logger.error("outbox.send.schedule_failed error_type=%s delivery_tag=%s",
+                                 type(exc).__name__, safe_identifier_tag(client_id))
                 return True
 
+            logger.info("send.encrypt.completed mode=legacy_box kind=%s recipient_tag=%s",
+                        kind, recipient_tag)
+            failure_stage = "transient_worker_start"
             worker = SendMessageWorker(account[1], account[3], payload)
             worker.finished.connect(
                 lambda success, data, w=worker: self._on_send_finished(success, data, msg_type, w),
@@ -3643,20 +4316,34 @@ class MainScreen(QFrame):
             return True
         except Exception as e:
             err_type = type(e).__name__
-            print(f"[SEND] Ошибка подготовки: {err_type}")
+            logger.warning("send.prepare.failed stage=%s error_type=%s kind=%s",
+                           failure_stage, err_type, kind)
             if durable:
                 QMessageBox.warning(
                     self,
                     "Сообщение не отправлено",
-                    f"Не удалось сохранить сообщение в очередь или контакт изменился. ({err_type})",
+                    "Не удалось подготовить защищённое сообщение для отправки. Оно не поставлено в очередь.",
                 )
             return False
 
     def _encrypt_durable_personal(self, context, payload_dict: dict, msg_type: str) -> dict:
+        import logging
+        from app.diagnostics import safe_identifier_tag, safe_message_kind
+
+        logger = logging.getLogger("max1m.delivery")
+        kind = safe_message_kind(msg_type)
+        recipient_tag = safe_identifier_tag(getattr(context, "device_id", None))
         pt_json = json.dumps(payload_dict, ensure_ascii=False)
         try:
-            from app.double_ratchet import encrypt_personal_envelope
+            from app.double_ratchet import DoubleRatchetEncryptionError, encrypt_personal_envelope
+        except ImportError as exc:
+            # A missing optional DR module (for example, an older frozen build)
+            # is the only error that permits compatibility encryption with Box.
+            logger.warning("send.encrypt.fallback mode=legacy_box reason=ratchet_module_unavailable error_type=%s kind=%s recipient_tag=%s",
+                           type(exc).__name__, kind, recipient_tag)
+            return crypto.encrypt_message(pt_json, context.public_key)
 
+        try:
             env, used_dr = encrypt_personal_envelope(
                 owner_username=context.owner_username,
                 owner_device_id=context.owner_device_id,
@@ -3666,20 +4353,50 @@ class MainScreen(QFrame):
                 plaintext=pt_json,
                 msg_kind=msg_type,
             )
-            if not used_dr:
+        except Exception as exc:
+            stage = exc.stage if isinstance(exc, DoubleRatchetEncryptionError) else "encrypt_or_session_lookup"
+            error_type = exc.cause_type if isinstance(exc, DoubleRatchetEncryptionError) else type(exc).__name__
+            logger.error("send.encrypt.failed mode=double_ratchet stage=%s error_type=%s kind=%s recipient_tag=%s",
+                         stage, error_type, kind, recipient_tag)
+            raise
+
+        if not used_dr:
+            try:
                 self._ensure_peer_ratchet_session(context)
-            return env
-        except Exception as dr_exc:
-            print(f"[DR] Fallback to NaCl Box for {msg_type}: {type(dr_exc).__name__}")
-            return crypto.encrypt_message(pt_json, context.public_key)
+            except Exception as exc:
+                # Box encryption already succeeded. Prekey setup is best-effort;
+                # it must not cause a second, ambiguously encrypted send.
+                logger.warning("send.ratchet.session_init.failed error_type=%s kind=%s recipient_tag=%s",
+                               type(exc).__name__, kind, recipient_tag)
+            mode = "legacy_box"
+        else:
+            mode = "double_ratchet"
+        logger.info("send.encrypt.completed mode=%s kind=%s recipient_tag=%s",
+                    mode, kind, recipient_tag)
+        return env
 
     def _encrypt_attachment_personal(
         self, context, message_dict: dict, kind: str, file_id: str, secret_key: str, msg_id: str
     ) -> dict:
+        import logging
+        from app.diagnostics import safe_identifier_tag, safe_message_kind
+
+        logger = logging.getLogger("max1m.delivery")
+        safe_kind = safe_message_kind(kind)
+        recipient_tag = safe_identifier_tag(getattr(context, "device_id", None))
         pt_json = json.dumps(message_dict, ensure_ascii=False)
         try:
-            from app.double_ratchet import attachment_commitment, encrypt_personal_envelope
+            from app.double_ratchet import (
+                DoubleRatchetEncryptionError,
+                attachment_commitment,
+                encrypt_personal_envelope,
+            )
+        except ImportError as exc:
+            logger.warning("send.encrypt.fallback mode=legacy_box reason=ratchet_module_unavailable error_type=%s kind=%s recipient_tag=%s",
+                           type(exc).__name__, safe_kind, recipient_tag)
+            return crypto.encrypt_message(pt_json, context.public_key)
 
+        try:
             att_commit = attachment_commitment(file_id, secret_key, msg_id)
             env, used_dr = encrypt_personal_envelope(
                 owner_username=context.owner_username,
@@ -3691,12 +4408,25 @@ class MainScreen(QFrame):
                 msg_kind=kind,
                 attachment_commit=att_commit,
             )
-            if not used_dr:
+        except Exception as exc:
+            stage = exc.stage if isinstance(exc, DoubleRatchetEncryptionError) else "encrypt_or_commitment"
+            error_type = exc.cause_type if isinstance(exc, DoubleRatchetEncryptionError) else type(exc).__name__
+            logger.error("send.encrypt.failed mode=double_ratchet stage=%s error_type=%s kind=%s recipient_tag=%s",
+                         stage, error_type, safe_kind, recipient_tag)
+            raise
+
+        if not used_dr:
+            try:
                 self._ensure_peer_ratchet_session(context)
-            return env
-        except Exception as dr_exc:
-            print(f"[DR] Attachment fallback to NaCl Box for {kind}: {type(dr_exc).__name__}")
-            return crypto.encrypt_message(pt_json, context.public_key)
+            except Exception as exc:
+                logger.warning("send.ratchet.session_init.failed error_type=%s kind=%s recipient_tag=%s",
+                               type(exc).__name__, safe_kind, recipient_tag)
+            mode = "legacy_box"
+        else:
+            mode = "double_ratchet"
+        logger.info("send.encrypt.completed mode=%s kind=%s recipient_tag=%s",
+                    mode, safe_kind, recipient_tag)
+        return env
 
     def sync_own_prekey_bundle(self):
         account = (state.username, state.server_url, state.device_id, state.token)
@@ -3720,13 +4450,26 @@ class MainScreen(QFrame):
                 self._net_workers.remove(w)
 
     def _on_prekey_status_received(self, ok: bool, res, worker):
+        import logging
+        import re
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
         worker.wait()
         if worker in self._net_workers:
             self._net_workers.remove(worker)
         account = (state.username, state.server_url, state.device_id, state.token)
-        if worker.account_context != account or not ok or not isinstance(res, dict):
+        device_tag = safe_identifier_tag(account[2])
+        if worker.account_context != account:
+            logger.info("ratchet.prekey.status.discarded reason=session_changed device_tag=%s", device_tag)
+            return
+        if not ok or not isinstance(res, dict):
+            status_match = re.match(r"^HTTP ([0-9]{3}):", res) if isinstance(res, str) else None
+            reason = f"http_{status_match.group(1)}" if status_match else type(res).__name__
+            logger.warning("ratchet.prekey.status.failed reason=%s device_tag=%s", reason, device_tag)
             return
         if getattr(crypto, "private_key", None) is None:
+            logger.warning("ratchet.prekey.status.skipped reason=local_private_key_missing device_tag=%s", device_tag)
             return
         from app.double_ratchet import DEFAULT_OPK_BATCH, OPK_REPLENISH_THRESHOLD, RatchetStore
         from app.workers import PublishPreKeyBundleWorker
@@ -3743,7 +4486,13 @@ class MainScreen(QFrame):
                 rotate_signed_prekey=not has_bundle,
             )
         except Exception as exc:
-            print(f"[X3DH] Не удалось подготовить пакет prekey: {type(exc).__name__}")
+            import logging
+            from app.diagnostics import safe_identifier_tag
+
+            logging.getLogger("max1m.delivery").warning(
+                "ratchet.prekey.prepare.failed stage=local_bundle error_type=%s device_tag=%s",
+                type(exc).__name__, safe_identifier_tag(account[2]),
+            )
             return
 
         pub_w = PublishPreKeyBundleWorker(account[1], account[3], bundle_payload)
@@ -3793,26 +4542,41 @@ class MainScreen(QFrame):
                 Qt.QueuedConnection,
             )
             cw.start()
-        except Exception:
+        except Exception as exc:
+            import logging
+            from app.diagnostics import safe_identifier_tag
+
+            logging.getLogger("max1m.delivery").warning(
+                "ratchet.session.ensure.failed error_type=%s recipient_tag=%s",
+                type(exc).__name__, safe_identifier_tag(getattr(context, "device_id", None)),
+            )
             if hasattr(self, "_inflight_prekey_claims"):
                 self._inflight_prekey_claims.discard(context.device_id)
 
     def _on_peer_prekey_claimed(self, ok: bool, data, dev_id: str, worker):
+        import logging
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
         worker.wait()
         if worker in self._net_workers:
             self._net_workers.remove(worker)
         if hasattr(self, "_inflight_prekey_claims"):
             self._inflight_prekey_claims.discard(dev_id)
+        recipient_tag = safe_identifier_tag(dev_id)
         account = (state.username, state.server_url, state.device_id, state.token)
         ctx = getattr(worker, "peer_context", None)
-        if (
-            worker.account_context != account
-            or not ok
-            or not isinstance(data, dict)
-            or ctx is None
-            or getattr(crypto, "private_key", None) is None
-            or not recipient_is_verified(state, ctx)
-        ):
+        if worker.account_context != account:
+            logger.info("ratchet.prekey.claim.discarded reason=session_changed recipient_tag=%s", recipient_tag)
+            return
+        if not ok or not isinstance(data, dict):
+            logger.warning("ratchet.prekey.claim.failed result_type=%s recipient_tag=%s",
+                           type(data).__name__, recipient_tag)
+            return
+        if (ctx is None or getattr(crypto, "private_key", None) is None
+                or not recipient_is_verified(state, ctx)):
+            logger.warning("ratchet.prekey.claim.rejected reason=recipient_or_identity_changed recipient_tag=%s",
+                           recipient_tag)
             return
         try:
             from app.double_ratchet import RatchetStore
@@ -3828,14 +4592,26 @@ class MainScreen(QFrame):
             if state.current_chat_type == "ally" and state.current_chat_username == ctx.username:
                 self._update_contact_identity_status()
         except Exception as exc:
-            print(f"[X3DH] Не удалось инициализировать Double Ratchet сессию: {type(exc).__name__}")
+            logger.warning("ratchet.session.init.failed error_type=%s recipient_tag=%s",
+                           type(exc).__name__, recipient_tag)
 
     def _on_send_finished(self, success: bool, data, msg_type: str, worker):
+        import logging
+        from app.diagnostics import safe_identifier_tag, safe_message_kind
+
         if worker in self._net_workers:
             self._net_workers.remove(worker)
-
-        if not success:
-            print(f"[SEND] Ошибка отправки ({msg_type}): {data}")
+        logger = logging.getLogger("max1m.delivery")
+        kind = safe_message_kind(msg_type)
+        sent_payload = getattr(worker, "payload", {})
+        recipient_tag = safe_identifier_tag(
+            sent_payload.get("receiver_device_id") if isinstance(sent_payload, dict) else None
+        )
+        if success:
+            logger.info("send.transient.completed result=accepted kind=%s recipient_tag=%s", kind, recipient_tag)
+        else:
+            logger.warning("send.transient.completed result=rejected error_type=%s kind=%s recipient_tag=%s",
+                           type(data).__name__, kind, recipient_tag)
             if msg_type in {"text", "image", "voice"}:
                 QMessageBox.warning(
                     self, "Отправка не подтверждена",
@@ -3849,6 +4625,10 @@ class MainScreen(QFrame):
             return
         if self._outbox_worker is not None or self._outbox_management_active:
             return
+        import logging
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
         account = (state.username, state.server_url, state.device_id, state.token)
         try:
             item = outbox.next_message(account[0], account[1], account[2], self._outbox_skipped)
@@ -3859,9 +4639,15 @@ class MainScreen(QFrame):
             if account != (state.username, state.server_url, state.device_id, state.token):
                 return
             path, record = item
+            message_tag = safe_identifier_tag(record.get("client_message_id"))
+            recipient_tag = safe_identifier_tag(record.get("receiver_device_id"))
+            logger.info("outbox.queue.selected delivery_tag=%s recipient_tag=%s retry=%s",
+                        message_tag, recipient_tag, bool(record.get("_send_attempted")))
             try:
                 recipient = verify_queued_recipient(state, crypto, record)
             except OutboxRecipientError:
+                logger.warning("outbox.send.paused reason=recipient_verification_failed delivery_tag=%s recipient_tag=%s",
+                               message_tag, recipient_tag)
                 self._outbox_skipped.add(path.name)
                 if not self._outbox_identity_warning_shown:
                     self._outbox_identity_warning_shown = True
@@ -3873,7 +4659,9 @@ class MainScreen(QFrame):
                 return
             # Restore the local history before any network request. If storage
             # fails, the encrypted queue record remains untouched for retry.
+            logger.info("outbox.local_restore.started delivery_tag=%s", message_tag)
             payload = outbox.prepare_network_payload(account[0], record)
+            logger.info("outbox.local_restore.completed delivery_tag=%s", message_tag)
             if account != (state.username, state.server_url, state.device_id, state.token):
                 return
             try:
@@ -3888,6 +4676,8 @@ class MainScreen(QFrame):
             mark_fn = getattr(outbox, "mark_send_attempted", None)
             if mark_fn is not None:
                 mark_fn(path, account[0], account[1], account[2])
+            logger.info("outbox.send.attempted delivery_tag=%s recipient_tag=%s",
+                        message_tag, recipient_tag)
             worker = ReliableSendWorker(account[1], account[3], payload)
             worker.expected_sender_device_id = account[2]
             worker.queue_path = path
@@ -3902,6 +4692,8 @@ class MainScreen(QFrame):
             )
             worker.start()
         except outbox.QueueRecordError as e:
+            logger.error("outbox.queue.record_rejected reason=unreadable_record record_tag=%s",
+                         safe_identifier_tag(e.path.name))
             self._outbox_skipped.add(e.path.name)
             if not self._outbox_warning_shown:
                 self._outbox_warning_shown = True
@@ -3910,7 +4702,8 @@ class MainScreen(QFrame):
         except Exception as e:
             if 'worker' in locals() and not worker.isRunning() and self._outbox_worker is worker:
                 self._outbox_worker = None
-            print(f"[OUTBOX] Ошибка локальной очереди: {type(e).__name__}")
+            logger.error("outbox.local.failed stage=queue_or_history error_type=%s delivery_tag=%s",
+                         type(e).__name__, locals().get("message_tag", "-"))
             if not self._outbox_warning_shown:
                 self._outbox_warning_shown = True
                 QMessageBox.warning(self, "Ошибка очереди", "Не удалось прочитать очередь сообщений. Данные не удалены.")
@@ -3919,8 +4712,16 @@ class MainScreen(QFrame):
                 QTimer.singleShot(250, self._try_outbox)
 
     def _on_outbox_finished(self, success, data, worker):
+        import logging
+        import re
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
         worker.wait()
+        payload = getattr(worker, "payload", {})
+        message_tag = safe_identifier_tag(payload.get("client_message_id") if isinstance(payload, dict) else None)
         if self._outbox_worker is not worker:
+            logger.warning("outbox.send.discarded reason=worker_replaced delivery_tag=%s", message_tag)
             return
         self._outbox_worker = None
         if success:
@@ -3928,24 +4729,34 @@ class MainScreen(QFrame):
                 outbox.acknowledge(worker.queue_path, worker.queue_username,
                                    worker.queue_server, worker.queue_device,
                                    worker.payload["client_message_id"])
+            except Exception as e:
+                logger.error("outbox.queue.ack_failed error_type=%s delivery_tag=%s",
+                             type(e).__name__, message_tag)
+                self._outbox_skipped.add(worker.queue_path.name)
+            else:
+                logger.info("outbox.queue.acknowledged delivery_tag=%s", message_tag)
                 self._outbox_skipped.discard(worker.queue_path.name)
                 history = worker.local_history or {}
                 if (state.username == worker.queue_username and state.device_id == worker.queue_device
                         and state.server_url.rstrip("/") == worker.queue_server.rstrip("/")
                         and state.current_chat_type == "ally"
                         and state.current_chat_username == history.get("ally_username")):
-                    for i in range(self.messages_layout.count()):
-                        bubble = self.messages_layout.itemAt(i).widget()
-                        if getattr(bubble, "msg_id", None) == history.get("msg_id") and hasattr(bubble, "status_label"):
-                            if hasattr(bubble, "mark_as_sent"):
-                                bubble.mark_as_sent("Сервер принял сообщение; это не подтверждение прочтения")
-                            break
-            except Exception as e:
-                print(f"[OUTBOX] Не удалось подтвердить локальную очередь: {type(e).__name__}")
-                self._outbox_skipped.add(worker.queue_path.name)
+                    try:
+                        for i in range(self.messages_layout.count()):
+                            bubble = self.messages_layout.itemAt(i).widget()
+                            if getattr(bubble, "msg_id", None) == history.get("msg_id") and hasattr(bubble, "status_label"):
+                                if hasattr(bubble, "mark_as_sent"):
+                                    bubble.mark_as_sent("Сервер принял сообщение; это не подтверждение прочтения")
+                                break
+                    except Exception as e:
+                        logger.warning("outbox.ui_update.failed error_type=%s delivery_tag=%s",
+                                       type(e).__name__, message_tag)
         else:
             self._outbox_skipped.add(worker.queue_path.name)
-            print(f"[OUTBOX] Сообщение сохранено для повтора: {data}")
+            http_match = re.match(r"^HTTP ([0-9]{3}):", data) if isinstance(data, str) else None
+            status_code = int(http_match.group(1)) if http_match else None
+            reason = f"http_{status_code}" if status_code is not None else type(data).__name__
+            logger.warning("outbox.send.retry reason=%s delivery_tag=%s", reason, message_tag)
             if isinstance(data, str) and data.startswith("HTTP 429:") and not self._outbox_warning_shown:
                 self._outbox_warning_shown = True
                 QMessageBox.warning(self, "Очередь получателя заполнена",
@@ -4508,6 +5319,9 @@ class MainScreen(QFrame):
             return False
         self._persist_preferred_contact_device(username, chosen_id)
         self._update_contact_identity_status()
+        refresh_presence = getattr(self, "_refresh_current_contact_presence", None)
+        if callable(refresh_presence):
+            refresh_presence()
         QTimer.singleShot(0, self._try_outbox)
         QTimer.singleShot(0, self._try_attachment_outbox)
         return True
@@ -4554,6 +5368,9 @@ class MainScreen(QFrame):
         self._incoming_identity_notice_shown = False
         self._update_contact_identity_status()
         self.contact_verification_changed.emit()
+        refresh_presence = getattr(self, "_refresh_current_contact_presence", None)
+        if callable(refresh_presence):
+            refresh_presence()
         QMessageBox.information(self, "Ключ проверен", "Совпадение ключа сохранено. Ожидающие сообщения будут проверены повторно.")
         QTimer.singleShot(0, self._try_outbox)
         QTimer.singleShot(0, self._try_attachment_outbox)
@@ -4588,7 +5405,10 @@ class MainScreen(QFrame):
             self._outbox_identity_warning_shown = False
             QMessageBox.information(self, "Очередь сообщений", "Выбранные ожидающие записи удалены. Проверьте историю перед повторной отправкой.")
         except Exception as exc:
-            print(f"[OUTBOX] Ошибка отмены: {type(exc).__name__}")
+            import logging
+            logging.getLogger("max1m.delivery").error(
+                "outbox.cancel.failed error_type=%s", type(exc).__name__
+            )
             QMessageBox.warning(self, "Ошибка очереди", "Не все записи удалось удалить. Проверьте очередь и хранилище.")
         finally:
             self._outbox_management_active = False
@@ -6232,7 +7052,6 @@ class MainScreen(QFrame):
         self.acc_btn.setObjectName("AcceptCallBtn")
         self.acc_btn.setFixedSize(140, 50)
         self.acc_btn.clicked.connect(self._accept_call)
-
         btn_row.addWidget(self.rej_btn)
         btn_row.addWidget(self.acc_btn)
         io_center_layout.addLayout(btn_row)
@@ -6279,6 +7098,14 @@ class MainScreen(QFrame):
         target_device_id = state.current_chat_device_id
         if not target_username or not target_device_id:
             return
+        presence_worker = getattr(self, "_contact_presence_worker", None)
+        if presence_worker is not None or getattr(self, "_contact_presence_pending", False):
+            QMessageBox.information(self, "Проверка устройства", "Проверяю подключение устройства собеседника. Повторите звонок через секунду.")
+            return
+        if (getattr(self, "_contact_presence_known", False)
+                and target_device_id not in getattr(self, "_contact_online_device_ids", set())):
+            QMessageBox.warning(self, "Устройство не подключено", "Звонок нельзя доставить: выбранное устройство сейчас не подключено.")
+            return
         if rtc.is_in_call() or self._active_call_device_id:
             return
         if not self._verify_call_contact(target_username, target_device_id):
@@ -6309,18 +7136,25 @@ class MainScreen(QFrame):
             QMessageBox.warning(self, "Ошибка звонка", "Нет подключения или не удалось подготовить защищённый сигнал звонка.")
 
     def _on_incoming_call(self, data: dict):
+        import logging
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
         from_device_id = data.get("from_device_id", "")
         # Never trust the display name supplied in an unauthenticated envelope.
         context = data.get("peer_context")
         from_username = context.username if context and context.device_id == from_device_id else None
         if not from_username or not call_context_valid(state, context, False):
-            print("[CALL] Отклонён звонок от неизвестного устройства")
+            logger.warning("call.incoming.rejected reason=unknown_or_unverified_peer device_tag=%s",
+                           safe_identifier_tag(from_device_id))
             return
 
-        print(f"[CALL] Входящий от @{from_username} ({from_device_id})")
+        logger.info("call.incoming.received sender_tag=%s device_tag=%s",
+                    safe_identifier_tag(from_username), safe_identifier_tag(from_device_id))
 
         if rtc.is_in_call() or self._active_call_device_id:
-            print("[CALL] Уже в звонке, отклоняем")
+            logger.warning("call.incoming.rejected reason=already_in_call device_tag=%s",
+                           safe_identifier_tag(from_device_id))
             main_window = self.window()
             if hasattr(main_window, "ws_worker") and main_window.ws_worker:
                 main_window._send_call_event("call_ended", from_device_id, data.get("call_id"))
@@ -6938,6 +7772,40 @@ class MainScreen(QFrame):
             if w in self._net_workers:
                 self._net_workers.remove(w)
 
+    @staticmethod
+    def _normalize_group_voice_roster(participants):
+        if not isinstance(participants, list):
+            return []
+        cleaned = []
+        seen = set()
+        for participant in participants:
+            if not isinstance(participant, dict):
+                continue
+            device_id = participant.get("device_id")
+            if (not isinstance(device_id, str) or not 1 <= len(device_id) <= 64
+                    or not all(ch.isascii() and (ch.isalnum() or ch in "_-") for ch in device_id)
+                    or device_id in seen):
+                continue
+            seen.add(device_id)
+            username = participant.get("username")
+            if not isinstance(username, str) or not 1 <= len(username) <= 50:
+                username = device_id[:8]
+            entry = {
+                "device_id": device_id,
+                "username": username,
+                "is_muted": participant.get("is_muted") is True,
+                "is_deafened": participant.get("is_deafened") is True,
+                "is_sharing_screen": participant.get("is_sharing_screen") is True,
+            }
+            for key, limit in (("public_key", 500), ("fingerprint", 100)):
+                value = participant.get(key)
+                if isinstance(value, str) and 1 <= len(value) <= limit:
+                    entry[key] = value
+            cleaned.append(entry)
+            if len(cleaned) >= 8:
+                break
+        return cleaned
+
     def _on_gv_worker_finished(self, ok: bool, res, group_id: str, action: str, worker):
         worker.wait()
         if worker in self._net_workers:
@@ -6949,7 +7817,15 @@ class MainScreen(QFrame):
                 QMessageBox.warning(self, "Голосовая комната", res)
             return
         if isinstance(res, dict) and "participants" in res:
-            participants = res.get("participants") or []
+            raw_participants = res.get("participants")
+            normalizer = getattr(self, "_normalize_group_voice_roster", None)
+            if callable(normalizer):
+                participants = normalizer(raw_participants)
+            elif isinstance(raw_participants, list):
+                participants = [p for p in raw_participants if isinstance(p, dict)
+                                and isinstance(p.get("device_id"), str)]
+            else:
+                participants = []
             self._group_voice_rosters[group_id] = participants
             if action == "join":
                 prefs = storage.get_call_audio_prefs(state.username) if state.username else {}
@@ -7068,6 +7944,7 @@ class MainScreen(QFrame):
         participants = data.get("participants")
         if not isinstance(gid, str) or not isinstance(participants, list):
             return
+        participants = self._normalize_group_voice_roster(participants)
         self._group_voice_rosters[gid] = participants
         if self._group_voice_ctrl.active_group_id == gid:
             self._group_voice_ctrl.update_participants(gid, participants)
@@ -7128,7 +8005,9 @@ class MainScreen(QFrame):
     def _refresh_group_voice_bar(self):
         if not hasattr(self, "group_voice_bar"):
             return
-        gvc = self._group_voice_ctrl
+        gvc = getattr(self, "_group_voice_ctrl", None)
+        if gvc is None:
+            return
         active_gid = gvc.active_group_id
         viewing_gid = state.current_group_id if state.current_chat_type == "group" else None
         display_gid = active_gid or viewing_gid
@@ -7137,13 +8016,19 @@ class MainScreen(QFrame):
             self.group_voice_bar.setVisible(False)
             return
 
-        roster = self._group_voice_rosters.get(display_gid, [])
+        rosters = getattr(self, "_group_voice_rosters", {})
+        raw_roster = rosters.get(display_gid, []) if isinstance(rosters, dict) else []
+        roster = self._normalize_group_voice_roster(raw_roster)
         in_room = active_gid == display_gid
         if not in_room and not roster and state.current_chat_type != "group":
             self.group_voice_bar.setVisible(False)
             return
 
-        grp_name = getattr(state, "groups", {}).get(display_gid, {}).get("name", "Группа")
+        groups = getattr(state, "groups", {})
+        group_data = groups.get(display_gid, {}) if isinstance(groups, dict) else {}
+        grp_name = group_data.get("name", "Группа") if isinstance(group_data, dict) else "Группа"
+        if not isinstance(grp_name, str) or not grp_name:
+            grp_name = "Группа"
         self.group_voice_bar.setVisible(True)
 
         if in_room:

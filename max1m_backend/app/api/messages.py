@@ -18,6 +18,7 @@ from .. import schemas, models, security
 from ..database import get_db, AsyncSessionLocal
 from ..config import settings
 from ..rate_limit import limiter
+from ..logging_security import safe_identifier_tag
 import json
 
 logger = logging.getLogger("max1m.messages")
@@ -116,20 +117,20 @@ class ConnectionManager:
         if previous is not None and previous is not websocket:
             self._send_states.pop(previous, None)
             await self._close_bounded(previous)
-        logger.info("Устройство %s подключилось.", device_id)
+        logger.info("ws.device.connected device_tag=%s", safe_identifier_tag(device_id))
 
     def disconnect(self, device_id: str):
         websocket = self.active_connections.pop(device_id, None)
         if websocket is not None:
             self._send_states.pop(websocket, None)
-            logger.info("Устройство %s отключилось.", device_id)
+            logger.info("ws.device.disconnected device_tag=%s", safe_identifier_tag(device_id))
 
     async def close_device(self, device_id: str):
         websocket = self.active_connections.pop(device_id, None)
         if websocket is not None:
             self._send_states.pop(websocket, None)
             await self._close_bounded(websocket)
-            logger.info("Соединение отозванного устройства %s принудительно закрыто.", device_id)
+            logger.info("ws.device.revoked_connection_closed device_tag=%s", safe_identifier_tag(device_id))
 
     async def _send(self, data, device_id, *, binary=False):
         websocket = self.active_connections.get(device_id)
@@ -159,7 +160,8 @@ class ConnectionManager:
                     await self._close_bounded(websocket)
                 raise
             except Exception as exc:
-                logger.warning("WebSocket send failed for %s: %s", device_id, type(exc).__name__)
+                logger.warning("ws.send.failed device_tag=%s error_type=%s",
+                               safe_identifier_tag(device_id), type(exc).__name__)
                 if self.active_connections.get(device_id) is websocket:
                     self.disconnect(device_id)
                     await self._close_bounded(websocket)
@@ -192,16 +194,20 @@ async def websocket_endpoint(
     # Updated clients authenticate in the header to keep tokens out of URLs.
     # Query tokens remain temporarily supported for legacy clients unless disabled.
     authorization = websocket.headers.get("authorization")
+    device_tag = safe_identifier_tag(device_id)
     if authorization is not None:
         scheme, separator, credentials = authorization.partition(" ")
         if not separator or scheme.lower() != "bearer" or not credentials.strip():
+            logger.warning("ws.auth.rejected reason=malformed_authorization device_tag=%s", device_tag)
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         token = credentials.strip()
     elif token is not None and not settings.ALLOW_LEGACY_WS_QUERY_TOKEN:
+        logger.warning("ws.auth.rejected reason=legacy_query_token_disabled device_tag=%s", device_tag)
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     if not token:
+        logger.warning("ws.auth.rejected reason=missing_token device_tag=%s", device_tag)
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     try:
@@ -211,21 +217,31 @@ async def websocket_endpoint(
         if (payload.get("device_id") != device_id or not isinstance(user_id, str)
                 or not user_id or not isinstance(payload.get("exp"), (int, float))
                 or token_sv is None):
+            logger.warning("ws.auth.rejected reason=invalid_claims device_tag=%s", device_tag)
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
-    except JWTError:
+    except JWTError as exc:
+        logger.warning("ws.auth.rejected reason=invalid_token error_type=%s device_tag=%s",
+                       type(exc).__name__, device_tag)
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
     # Do not cache authorisation: a newly revoked device or invalidated session must not reconnect.
-    async with AsyncSessionLocal() as db:
-        if not await _device_is_authorized(db, device_id, user_id, token_sv):
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-        await _touch_device_last_seen_throttled(db, device_id)
+    try:
+        async with AsyncSessionLocal() as db:
+            if not await _device_is_authorized(db, device_id, user_id, token_sv):
+                logger.warning("ws.auth.rejected reason=device_or_session_unavailable device_tag=%s", device_tag)
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+            await _touch_device_last_seen_throttled(db, device_id)
+    except Exception as exc:
+        logger.error("ws.auth.failed stage=database_check error_type=%s device_tag=%s",
+                     type(exc).__name__, device_tag)
+        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        return
 
     await manager.connect(websocket, device_id)
-    logger.info("WS connected: %s", device_id)
+    logger.info("ws.connected device_tag=%s", device_tag)
 
     async def revalidate_connection():
         while True:
@@ -242,9 +258,11 @@ async def websocket_endpoint(
                     continue
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 # Fail closed if the token expires or authorization cannot be checked.
-                logger.warning("Unable to revalidate WebSocket for %s", device_id)
+                logger.warning("ws.auth.revalidation_failed error_type=%s device_tag=%s",
+                               type(exc).__name__, device_tag)
+            logger.warning("ws.auth.rejected reason=expired_revoked_or_unavailable device_tag=%s", device_tag)
             if manager.active_connections.get(device_id) is websocket:
                 manager.disconnect(device_id)
             with suppress(Exception):
@@ -279,7 +297,7 @@ async def websocket_endpoint(
                 )
                 last_recv_ts = now_mono
                 if recv_tokens < 1.0:
-                    logger.warning("WS rate limit exceeded for %s", device_id)
+                    logger.warning("ws.receive.rejected reason=rate_limit device_tag=%s", device_tag)
                     await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                     break
                 recv_tokens -= 1.0
@@ -291,7 +309,8 @@ async def websocket_endpoint(
                 try:
                     data = json.loads(raw, parse_constant=_reject_non_finite_json)
                 except Exception as e:
-                    logger.warning("Bad json from %s: %s", device_id, type(e).__name__)
+                    logger.warning("ws.receive.rejected reason=invalid_json error_type=%s device_tag=%s",
+                                   type(e).__name__, device_tag)
                     continue
 
                 if not isinstance(data, dict):
@@ -305,12 +324,13 @@ async def websocket_endpoint(
                     relayed = {k: v for k, v in data.items() if k in ALLOWED_RELAY_FIELDS}
                     relayed["from_device_id"] = device_id
                     if not _validate_relay_frame(relayed):
-                        logger.warning("Rejected malformed/deep WS relay payload from %s", device_id)
+                        logger.warning("ws.relay.rejected reason=invalid_payload device_tag=%s", device_tag)
                         continue
-                    logger.debug("RELAY %s: %s → %s", msg_type, device_id, to_device_id)
+                    logger.debug("ws.relay.forwarded event_type=%s sender_tag=%s recipient_tag=%s",
+                                 msg_type, device_tag, safe_identifier_tag(to_device_id))
                     await manager.send_personal_message(relayed, to_device_id)
                 else:
-                    logger.debug("recv %s from %s", msg_type, device_id)
+                    logger.debug("ws.frame.ignored reason=unrecognized_type device_tag=%s", device_tag)
 
             elif message.get("bytes") is not None:
                 # Binary relay is unsupported; close rather than accepting an
@@ -319,9 +339,10 @@ async def websocket_endpoint(
                 break
 
     except WebSocketDisconnect:
-        logger.info("WS disconnect: %s", device_id)
-    except Exception as e:
-        logger.error("WS fatal for %s: %s", device_id, e, exc_info=True)
+        logger.info("ws.disconnected device_tag=%s", device_tag)
+    except Exception as exc:
+        # Exception strings may include peer-controlled content or credentials.
+        logger.error("ws.failed error_type=%s device_tag=%s", type(exc).__name__, device_tag)
     finally:
         auth_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -475,11 +496,16 @@ async def _create_message(db: AsyncSession, sender_device_id: str,
     # insertions and ACKs, including concurrent requests in separate processes.
     try:
         await db.execute(text("BEGIN IMMEDIATE"))
-        sender = (await db.execute(select(models.Device.id).join(models.User).where(
-            models.Device.id == sender_device_id, models.Device.is_revoked == False,
-            models.User.is_active == True))).scalar_one_or_none()
+        sender = (await db.execute(
+            select(models.User.id, models.User.username)
+            .select_from(models.Device)
+            .join(models.User, models.User.id == models.Device.user_id)
+            .where(models.Device.id == sender_device_id, models.Device.is_revoked == False,
+                   models.User.is_active == True)
+        )).one_or_none()
         if sender is None:
             raise HTTPException(401, "Sender device is unavailable")
+        sender_user_id, sender_username = sender
         if message_id:
             existing = await db.get(models.Message, message_id)
             if existing:
@@ -489,6 +515,8 @@ async def _create_message(db: AsyncSession, sender_device_id: str,
                         or existing.signature != msg_in.signature):
                     raise HTTPException(409, "Message identifier conflict")
                 # An idempotent retry must work even when the queue is full.
+                existing.sender_user_id = sender_user_id
+                existing.sender_username = sender_username
                 await db.commit()
                 return existing, False
             tombstone = await db.get(models.MessageIdempotencyRecord, message_id)
@@ -505,6 +533,8 @@ async def _create_message(db: AsyncSession, sender_device_id: str,
                 echo = SimpleNamespace(
                     id=message_id,
                     sender_device_id=sender_device_id,
+                    sender_user_id=sender_user_id,
+                    sender_username=sender_username,
                     receiver_device_id=msg_in.receiver_device_id,
                     encrypted_blob=msg_in.encrypted_blob,
                     signature=msg_in.signature,
@@ -520,18 +550,73 @@ async def _create_message(db: AsyncSession, sender_device_id: str,
         db.add(message)
         await db.commit()
         await db.refresh(message)
+        message.sender_user_id = sender_user_id
+        message.sender_username = sender_username
         return message, True
     except Exception:
         await db.rollback()
         raise
 
 
+async def _attach_sender_directory_metadata(db: AsyncSession, messages: list):
+    """Attach server-resolved sender ownership as an untrusted directory hint."""
+    sender_ids = {
+        message.sender_device_id for message in messages
+        if isinstance(getattr(message, "sender_device_id", None), str)
+    }
+    if not sender_ids:
+        return messages
+    rows = await db.execute(
+        select(models.Device.id, models.User.id, models.User.username)
+        .select_from(models.Device)
+        .join(models.User, models.User.id == models.Device.user_id)
+        .where(models.Device.id.in_(sender_ids))
+    )
+    owners = {device_id: (user_id, username) for device_id, user_id, username in rows.all()}
+    for message in messages:
+        owner = owners.get(getattr(message, "sender_device_id", None))
+        message.sender_user_id = owner[0] if owner else None
+        message.sender_username = owner[1] if owner else None
+    return messages
+
+
 async def _notify_message(message):
-    await manager.send_personal_message({
-        "type": "new_message", "message_id": message.id,
-        "sender_device_id": message.sender_device_id, "encrypted_blob": message.encrypted_blob,
+    # `id` is the canonical sync-safe delivery ID. Keep `message_id` as an alias
+    # for clients that consumed the original WebSocket event shape.
+    sent = await manager.send_personal_message({
+        "type": "new_message",
+        "id": message.id,
+        "message_id": message.id,
+        "sender_device_id": message.sender_device_id,
+        "sender_user_id": getattr(message, "sender_user_id", None),
+        "sender_username": getattr(message, "sender_username", None),
+        "encrypted_blob": message.encrypted_blob,
         "signature": message.signature, "created_at": message.created_at.isoformat(),
     }, message.receiver_device_id)
+    logger.info(
+        "message.live_notification.result status=%s delivery_tag=%s sender_tag=%s recipient_tag=%s",
+        "sent" if sent else "pending_sync",
+        safe_identifier_tag(message.id),
+        safe_identifier_tag(message.sender_device_id),
+        safe_identifier_tag(message.receiver_device_id),
+    )
+
+
+_SAFE_SEND_REJECTION_REASONS = {
+    (401, "Sender device is unavailable"): "sender_device_unavailable",
+    (404, "Устройство получателя недоступно"): "recipient_unavailable",
+    (409, "Message identifier conflict"): "idempotency_conflict",
+    (413, "Message payload too large"): "payload_too_large",
+    (422, "Invalid message encoding"): "invalid_message_encoding",
+    (429, "Очередь получателя заполнена; повторите позже"): "recipient_queue_full",
+    (503, "Invalid queue limit configuration"): "server_queue_configuration",
+}
+
+
+def _safe_send_rejection_reason(exc: HTTPException) -> str:
+    """Map known server responses to log-safe reasons; never echo exception detail."""
+    detail = exc.detail if isinstance(exc.detail, str) else ""
+    return _SAFE_SEND_REJECTION_REASONS.get((exc.status_code, detail), "server_policy")
 
 
 @router.post("/send", response_model=schemas.MessageResponse)
@@ -541,9 +626,24 @@ async def send_message(request: Request,
                        sender_device_id: str = Depends(get_current_device_id),
                        db: AsyncSession = Depends(get_db)):
     """Legacy non-idempotent send, with bounded pending queue."""
+    sender_tag = safe_identifier_tag(sender_device_id)
+    recipient_tag = safe_identifier_tag(msg_in.receiver_device_id)
     if not _SAFE_WS_DEVICE_ID_RE.fullmatch(msg_in.receiver_device_id):
+        logger.warning("message.send.rejected status=404 reason=invalid_recipient_id sender_tag=%s recipient_tag=%s",
+                       sender_tag, recipient_tag)
         raise HTTPException(status_code=404, detail="Устройство получателя недоступно")
-    message, _ = await _create_message(db, sender_device_id, msg_in)
+    try:
+        message, _ = await _create_message(db, sender_device_id, msg_in)
+    except HTTPException as exc:
+        logger.warning("message.send.rejected status=%d reason=%s sender_tag=%s recipient_tag=%s",
+                       exc.status_code, _safe_send_rejection_reason(exc), sender_tag, recipient_tag)
+        raise
+    except Exception as exc:
+        logger.error("message.send.failed stage=database error_type=%s sender_tag=%s recipient_tag=%s",
+                     type(exc).__name__, sender_tag, recipient_tag)
+        raise
+    logger.info("message.send.accepted mode=legacy delivery_tag=%s sender_tag=%s recipient_tag=%s",
+                safe_identifier_tag(message.id), sender_tag, recipient_tag)
     await _notify_message(message)
     return message
 
@@ -555,9 +655,26 @@ async def send_reliable_message(request: Request,
                                 sender_device_id: str = Depends(get_current_device_id),
                                 db: AsyncSession = Depends(get_db)):
     """Retry identical ciphertext by UUID without allocating a second queue slot."""
+    sender_tag = safe_identifier_tag(sender_device_id)
+    recipient_tag = safe_identifier_tag(msg_in.receiver_device_id)
+    client_tag = safe_identifier_tag(str(msg_in.client_message_id))
     if not _SAFE_WS_DEVICE_ID_RE.fullmatch(msg_in.receiver_device_id):
+        logger.warning("message.send.rejected mode=reliable status=404 reason=invalid_recipient_id client_tag=%s sender_tag=%s recipient_tag=%s",
+                       client_tag, sender_tag, recipient_tag)
         raise HTTPException(status_code=404, detail="Устройство получателя недоступно")
-    message, inserted = await _create_message(db, sender_device_id, msg_in, str(msg_in.client_message_id))
+    try:
+        message, inserted = await _create_message(db, sender_device_id, msg_in, str(msg_in.client_message_id))
+    except HTTPException as exc:
+        logger.warning("message.send.rejected mode=reliable status=%d reason=%s client_tag=%s sender_tag=%s recipient_tag=%s",
+                       exc.status_code, _safe_send_rejection_reason(exc), client_tag, sender_tag, recipient_tag)
+        raise
+    except Exception as exc:
+        logger.error("message.send.failed mode=reliable stage=database error_type=%s client_tag=%s sender_tag=%s recipient_tag=%s",
+                     type(exc).__name__, client_tag, sender_tag, recipient_tag)
+        raise
+    logger.info("message.send.accepted mode=reliable result=%s delivery_tag=%s sender_tag=%s recipient_tag=%s",
+                "inserted" if inserted else "idempotent_retry",
+                safe_identifier_tag(message.id), sender_tag, recipient_tag)
     if inserted:
         await _notify_message(message)
     return message
@@ -588,7 +705,7 @@ async def sync_messages(
             m.delivered_at = now
 
     await db.commit()
-    return messages
+    return await _attach_sender_directory_metadata(db, messages)
 
 @router.get("/sync-safe", response_model=List[schemas.MessageResponse])
 @limiter.limit(lambda: settings.RATE_LIMIT_MESSAGE_SYNC)
@@ -604,7 +721,11 @@ async def sync_messages_safe(
     The cursor is a message ID belonging to this device; acknowledged rows (or
     their compact idempotency tombstones) keep the cursor valid across pages.
     """
+    device_tag = safe_identifier_tag(device_id)
+    after_tag = safe_identifier_tag(after)
     if after is not None and not _SAFE_WS_DEVICE_ID_RE.fullmatch(after):
+        logger.warning("message.sync.rejected reason=invalid_cursor device_tag=%s after_tag=%s",
+                       device_tag, after_tag)
         raise HTTPException(status_code=400, detail="Invalid cursor")
     stmt = select(models.Message).where(
         models.Message.receiver_device_id == device_id,
@@ -621,6 +742,8 @@ async def sync_messages_safe(
         else:
             tombstone = await db.get(models.MessageIdempotencyRecord, after)
             if tombstone is None or tombstone.receiver_device_id != device_id:
+                logger.warning("message.sync.rejected reason=cursor_not_found device_tag=%s after_tag=%s",
+                               device_tag, after_tag)
                 raise HTTPException(status_code=400, detail="Invalid cursor")
             cursor_created_at = tombstone.original_created_at
             cursor_id = tombstone.message_id
@@ -629,7 +752,14 @@ async def sync_messages_safe(
             and_(models.Message.created_at == cursor_created_at, models.Message.id > cursor_id),
         ))
     result = await db.execute(stmt.order_by(models.Message.created_at, models.Message.id).limit(limit))
-    return result.scalars().all()
+    messages = result.scalars().all()
+    messages = await _attach_sender_directory_metadata(db, messages)
+    delivery_tags = ",".join(safe_identifier_tag(message.id) for message in messages)
+    logger.info(
+        "message.sync.completed device_tag=%s after_tag=%s count=%d limit=%d has_more=%s delivery_tags=%s",
+        device_tag, after_tag, len(messages), limit, len(messages) == limit, delivery_tags or "-",
+    )
+    return messages
 
 
 @router.post("/ack")
@@ -641,6 +771,10 @@ async def acknowledge_messages(
         db: AsyncSession = Depends(get_db),
 ):
     """Idempotently acknowledge only messages addressed to this device."""
+    device_tag = safe_identifier_tag(device_id)
+    delivery_tags = ",".join(safe_identifier_tag(message_id) for message_id in ack.message_ids)
+    logger.info("message.ack.started device_tag=%s requested=%d delivery_tags=%s",
+                device_tag, len(ack.message_ids), delivery_tags or "-")
     # Authentication runs before the endpoint, so revocation could otherwise
     # race it and mark messages delivered after a device has been disabled.
     try:
@@ -651,7 +785,7 @@ async def acknowledge_messages(
         if authorized is None:
             raise HTTPException(401, "Device unavailable")
         now = datetime.now(timezone.utc)
-        await db.execute(
+        update_result = await db.execute(
             update(models.Message)
             .where(models.Message.receiver_device_id == device_id, models.Message.id.in_(ack.message_ids))
             .values(
@@ -659,10 +793,16 @@ async def acknowledge_messages(
                 delivered_at=func.coalesce(models.Message.delivered_at, now),
             )
         )
+        affected = getattr(update_result, "rowcount", None)
         await db.commit()
+        logger.info("message.ack.completed device_tag=%s requested=%d affected=%s delivery_tags=%s",
+                    device_tag, len(ack.message_ids), affected if affected is not None else "unknown",
+                    delivery_tags or "-")
         return {"status": "ok"}
-    except BaseException:
+    except BaseException as exc:
         await db.rollback()
+        logger.warning("message.ack.failed error_type=%s device_tag=%s requested=%d",
+                       type(exc).__name__, device_tag, len(ack.message_ids))
         raise
 
 

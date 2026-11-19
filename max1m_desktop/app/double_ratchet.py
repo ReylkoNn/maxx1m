@@ -58,6 +58,19 @@ class RatchetError(ValueError):
     """Raised when X3DH or Double Ratchet verification/decryption fails closed."""
 
 
+class DoubleRatchetEncryptionError(RuntimeError):
+    """An established ratchet could not encrypt; callers must not downgrade."""
+
+    _SAFE_STAGES = {"store_open", "session_lookup", "encrypt", "sign"}
+
+    def __init__(self, stage: str, cause_type: str = "Exception"):
+        self.stage = stage if isinstance(stage, str) and stage in self._SAFE_STAGES else "unknown"
+        valid_cause = (isinstance(cause_type, str) and cause_type.isidentifier()
+                       and len(cause_type) <= 64)
+        self.cause_type = cause_type if valid_cause else "Exception"
+        super().__init__("Double Ratchet encryption failed")
+
+
 class ReplayAlreadyProcessed(Exception):
     """Indicates an exact, already-authenticated server delivery retry (safe to ACK)."""
 
@@ -989,19 +1002,31 @@ def encrypt_personal_envelope(
     """
     Encrypt a personal 1-on-1 envelope using an active X3DH + Double Ratchet session
     when available, returning `(envelope_dict, used_double_ratchet)`.
-    Falls back cleanly to signed NaCl Box if the peer device has no established DR session yet.
+
+    Signed NaCl Box is used only when there is no established DR session (or the
+    optional DR module is unavailable at the caller). Once a session exists,
+    storage, ratchet, or signing failures are surfaced instead of silently
+    downgrading to Box, which the recipient may no longer be able to decrypt.
     """
-    if (
+    eligible_for_ratchet = (
         isinstance(owner_username, str)
-        and owner_username
+        and bool(owner_username)
         and isinstance(owner_device_id, str)
-        and owner_device_id
+        and bool(owner_device_id)
         and getattr(crypto_mgr, "private_key", None) is not None
         and msg_kind in {"text", "image", "voice", "file", "edit_msg", "pin_msg", "delete_msg", "read_ack", "typing"}
-    ):
+    )
+    if eligible_for_ratchet:
         try:
             store = RatchetStore(owner_username)
-            if store.has_active_session(recipient_device_id, recipient_pub_b64):
+        except Exception as exc:
+            raise DoubleRatchetEncryptionError("store_open", type(exc).__name__) from None
+        try:
+            has_session = store.has_active_session(recipient_device_id, recipient_pub_b64)
+        except Exception as exc:
+            raise DoubleRatchetEncryptionError("session_lookup", type(exc).__name__) from None
+        if has_session:
+            try:
                 wire_blob = store.encrypt_for_peer(
                     our_ik_b64=crypto_mgr.get_public_key_b64(),
                     our_device_id=owner_device_id,
@@ -1011,10 +1036,13 @@ def encrypt_personal_envelope(
                     msg_kind=msg_kind,
                     attachment_commit=attachment_commit,
                 )
+            except Exception as exc:
+                raise DoubleRatchetEncryptionError("encrypt", type(exc).__name__) from None
+            try:
                 sig = sign_dr_blob(crypto_mgr.private_key, wire_blob)
-                return {"encrypted_blob": wire_blob, "signature": sig}, True
-        except Exception:
-            pass
+            except Exception as exc:
+                raise DoubleRatchetEncryptionError("sign", type(exc).__name__) from None
+            return {"encrypted_blob": wire_blob, "signature": sig}, True
 
     return crypto_mgr.encrypt_message(plaintext, recipient_pub_b64), False
 

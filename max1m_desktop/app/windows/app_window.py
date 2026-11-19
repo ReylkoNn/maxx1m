@@ -825,6 +825,7 @@ class InAppNotification(QWidget):
         self.slide_anim = QPropertyAnimation(self, b"geometry")
         self.slide_anim.setDuration(300)
         self.slide_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.slide_anim.finished.connect(self._on_slide_animation_finished)
 
         self._is_hiding = False
 
@@ -912,23 +913,17 @@ class InAppNotification(QWidget):
         current_geo = self.geometry()
         end_x = screen.width() + 10
 
-        try:
-            self.slide_anim.finished.disconnect()
-        except (RuntimeError, TypeError):
-            pass
-
         self.slide_anim.setStartValue(current_geo)
         self.slide_anim.setEndValue(
             QRect(end_x, current_geo.y(), current_geo.width(), current_geo.height())
         )
-        self.slide_anim.finished.connect(self._on_hide_finished)
         self.slide_anim.start()
 
-    def _on_hide_finished(self):
-        try:
-            self.slide_anim.finished.disconnect(self._on_hide_finished)
-        except (RuntimeError, TypeError):
-            pass
+    def _on_slide_animation_finished(self):
+        # The same animation drives both the entrance and exit. Only hide after
+        # the exit animation; keep a single stable signal connection.
+        if not self._is_hiding:
+            return
         self.hide()
         self._is_hiding = False
 
@@ -1965,10 +1960,24 @@ class AppWindow(QMainWindow):
 
     def _connect_ws_event(self, worker, signal, handler):
         def deliver(data):
+            import logging
+            from app.diagnostics import safe_identifier_tag
+
+            logger = logging.getLogger("max1m.delivery")
             try:
                 if (worker is self.ws_worker and worker.account_context ==
                         (state.username, state.server_url, state.device_id, state.token)):
-                    handler(data)
+                    try:
+                        handler(data)
+                    except Exception as exc:
+                        if isinstance(data, dict) and data.get("type") == "new_message":
+                            logger.error("ws.message.handler_failed error_type=%s delivery_tag=%s",
+                                         type(exc).__name__,
+                                         safe_identifier_tag(data.get("id") or data.get("message_id")))
+                        raise
+                elif isinstance(data, dict) and data.get("type") == "new_message":
+                    logger.warning("ws.message.discarded reason=stale_session delivery_tag=%s",
+                                   safe_identifier_tag(data.get("id") or data.get("message_id")))
             finally:
                 worker.release_event()
         signal.connect(deliver, Qt.QueuedConnection)
@@ -2004,37 +2013,60 @@ class AppWindow(QMainWindow):
         QTimer.singleShot(250, self._start_message_sync)
 
     def _start_message_sync(self):
+        import logging
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
         if not state.token or not state.server_url:
+            logger.debug("sync.request.skipped reason=no_active_session")
             return
         if self.sync_worker is not None or self._ack_worker is not None:
+            logger.debug("sync.request.skipped reason=worker_in_flight")
             return
         self._sync_restart_requested = False
+        logger.info("sync.request.scheduled after_tag=%s", safe_identifier_tag(self._sync_cursor))
         self.sync_worker = SyncMessagesWorker(state.server_url, state.token, self._sync_cursor)
         worker = self.sync_worker
         worker.account_context = (state.username, state.server_url, state.device_id, state.token)
         worker.finished.connect(lambda ok, data, w=worker: self._on_sync_finished(ok, data, w), Qt.QueuedConnection)
-        worker.start()
+        try:
+            worker.start()
+        except Exception as exc:
+            self.sync_worker = None
+            logger.error("sync.request.start_failed error_type=%s", type(exc).__name__)
+            raise
 
     def _on_sync_finished(self, success: bool, messages: list | str, worker):
+        import logging
+        import re
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
         worker.wait()
         if worker is not self.sync_worker:
+            logger.warning("sync.page.discarded reason=worker_replaced")
             return
         self.sync_worker = None
+        cursor_tag = safe_identifier_tag(getattr(worker, "after", None))
         if worker.account_context != (state.username, state.server_url, state.device_id, state.token):
+            logger.warning("sync.page.discarded reason=session_changed after_tag=%s", cursor_tag)
             self._sync_cursor = None
             return
         if not success or not isinstance(messages, list):
-            if isinstance(messages, str) and messages.startswith(("HTTP 401:", "HTTP 403:")):
+            http_match = re.match(r"^HTTP ([0-9]{3}):", messages) if isinstance(messages, str) else None
+            status_code = int(http_match.group(1)) if http_match else None
+            reason = f"http_{status_code}" if status_code is not None else type(messages).__name__
+            logger.warning("sync.page.failed reason=%s after_tag=%s", reason, cursor_tag)
+            if status_code in (401, 403):
                 invalidate_fn = getattr(self, "_handle_remote_session_invalidated", None)
                 if callable(invalidate_fn):
                     invalidate_fn("Сессия истекла или устройство отозвано. Выполните вход снова.")
                 return
-            print(f"[SYNC] Ошибка безопасной синхронизации: {messages}")
             self._sync_cursor = None
             if self._sync_restart_requested:
                 self._sync_restart_requested = False
                 QTimer.singleShot(250, self._start_message_sync)
-            if isinstance(messages, str) and messages.startswith("HTTP 404:") and not self._sync_version_warning_shown:
+            if status_code == 404 and not self._sync_version_warning_shown:
                 self._sync_version_warning_shown = True
                 QMessageBox.warning(
                     self, "Требуется обновление сервера",
@@ -2044,11 +2076,13 @@ class AppWindow(QMainWindow):
                 )
             return
         if not hasattr(self, "main_screen") or self.main_screen is None:
+            logger.warning("sync.page.discarded reason=screen_unavailable after_tag=%s", cursor_tag)
             self._sync_cursor = None
             return
 
         account_context = worker.account_context
         screen = self.main_screen
+
         def process_for_account(message):
             current = (state.username, state.server_url, state.device_id, state.token)
             if current != account_context or getattr(self, "main_screen", None) is not screen:
@@ -2061,9 +2095,15 @@ class AppWindow(QMainWindow):
         if (getattr(self, "main_screen", None) is not screen or account_context !=
                 (state.username, state.server_url, state.device_id, state.token)):
             # Never acknowledge or advance a page under a different session.
+            logger.warning("sync.page.discarded reason=session_changed_during_processing after_tag=%s",
+                           cursor_tag)
             self._sync_cursor = None
             return
 
+        processed_tags = ",".join(safe_identifier_tag(message_id) for message_id in processed)
+        logger.info("sync.page.processed received=%d accepted=%d rejected=%d after_tag=%s next_cursor_tag=%s delivery_tags=%s",
+                    len(messages), len(processed), max(0, len(messages) - len(processed)),
+                    cursor_tag, safe_identifier_tag(next_cursor), processed_tags or "-")
         if processed:
             # Only one acknowledgement request may run at a time. Continue the
             # scan only after it finishes; otherwise slow servers can create an
@@ -2074,36 +2114,65 @@ class AppWindow(QMainWindow):
             self._ack_worker = worker
             worker.finished.connect(lambda ok, result, w=worker: self._on_delivery_ack_finished(ok, result, w),
                                     Qt.QueuedConnection)
-            worker.start()
+            try:
+                worker.start()
+            except Exception as exc:
+                self._ack_worker = None
+                self._sync_cursor = None
+                logger.error("ack.request.start_failed error_type=%s delivery_tags=%s",
+                             type(exc).__name__, processed_tags or "-")
+                QTimer.singleShot(250, self._start_message_sync)
             return
         self._continue_message_sync(next_cursor)
 
     def _continue_message_sync(self, next_cursor):
+        import logging
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
         if self._sync_restart_requested:
             self._sync_cursor = None
             self._sync_restart_requested = False
+            logger.info("sync.cursor.reset reason=restart_requested")
             QTimer.singleShot(250, self._start_message_sync)
         elif next_cursor:
             self._sync_cursor = next_cursor
+            logger.info("sync.cursor.advanced cursor_tag=%s", safe_identifier_tag(next_cursor))
             QTimer.singleShot(250, self._start_message_sync)
         else:
             self._sync_cursor = None
+            logger.info("sync.page.complete")
 
     def _on_delivery_ack_finished(self, success: bool, result, worker):
+        import logging
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
         worker.wait()
         if worker is not self._ack_worker:
+            logger.warning("ack.completed.discarded reason=worker_replaced")
             return
         self._ack_worker = None
+        ids = getattr(worker, "message_ids", [])
+        delivery_tags = ",".join(safe_identifier_tag(item) for item in ids if isinstance(item, str))
         if worker.account_context != (state.username, state.server_url, state.device_id, state.token):
+            logger.warning("ack.completed.discarded reason=session_changed delivery_tags=%s",
+                           delivery_tags or "-")
             self._sync_cursor = None
             return
-        if not success:
-            if result in (401, 403):
+        if success:
+            logger.info("ack.completed result=accepted count=%d delivery_tags=%s",
+                        len(ids) if isinstance(ids, list) else 0, delivery_tags or "-")
+        else:
+            status_code = result if isinstance(result, int) and not isinstance(result, bool) else None
+            reason = f"http_{status_code}" if status_code is not None else type(result).__name__
+            logger.warning("ack.completed result=rejected reason=%s delivery_tags=%s",
+                           reason, delivery_tags or "-")
+            if status_code in (401, 403):
                 invalidate_fn = getattr(self, "_handle_remote_session_invalidated", None)
                 if callable(invalidate_fn):
                     invalidate_fn("Сессия истекла или устройство отозвано. Выполните вход снова.")
                 return
-            print(f"[SYNC] Не удалось подтвердить доставку: {result}; повторим при следующей синхронизации")
         self._continue_message_sync(worker.next_cursor)
 
     def _on_incoming_message(self, data: dict):
@@ -2158,7 +2227,12 @@ class AppWindow(QMainWindow):
         self.in_app_toast.show_notification(title, message, is_group=is_group)
 
     def _on_notification_clicked(self, sender_username: str):
-        print(f"[NOTIFY] Клик: {sender_username}")
+        import logging
+        from app.diagnostics import safe_identifier_tag
+
+        logging.getLogger("max1m.delivery").info(
+            "notification.clicked sender_tag=%s", safe_identifier_tag(sender_username)
+        )
 
         if self.isMinimized():
             self.showNormal()
@@ -2175,25 +2249,41 @@ class AppWindow(QMainWindow):
             self.main_screen.open_chat_by_username(sender_username)
 
     def _on_incoming_group_message(self, data: dict):
-        print(f"[WS GROUP] Групповое сообщение: {data.get('group_id')}")
+        import logging
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
+        logger.info("ws.group.message.received group_tag=%s delivery_tag=%s",
+                    safe_identifier_tag(data.get("group_id") if isinstance(data, dict) else None),
+                    safe_identifier_tag((data.get("id") or data.get("message_id")) if isinstance(data, dict) else None))
         if hasattr(self, "main_screen") and hasattr(self.main_screen, "process_incoming_group_message"):
             self.main_screen.process_incoming_group_message(data)
         else:
-            print("[GROUPS] Сообщение оставлено на сервере: приём групп временно недоступен")
+            logger.warning("ws.group.message.deferred reason=receiver_unavailable")
 
     def _on_group_created_event(self, data: dict):
-        print(f"[WS GROUP] Создана группа: {data.get('group_name')}")
+        import logging
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
+        logger.info("ws.group.created.received group_tag=%s",
+                    safe_identifier_tag(data.get("group_id") or data.get("id") if isinstance(data, dict) else None))
         if hasattr(self, "main_screen") and hasattr(self.main_screen, "process_group_created_event"):
             self.main_screen.process_group_created_event(data)
         else:
-            print("[GROUPS] Обновление группы будет загружено при следующем входе")
+            logger.warning("ws.group.created.deferred reason=receiver_unavailable")
 
     def _on_group_invited_event(self, data: dict):
-        print(f"[WS GROUP] Приглашение в группу: {data.get('group_id')}")
+        import logging
+        from app.diagnostics import safe_identifier_tag
+
+        logger = logging.getLogger("max1m.delivery")
+        logger.info("ws.group.invitation.received group_tag=%s",
+                    safe_identifier_tag(data.get("group_id") or data.get("id") if isinstance(data, dict) else None))
         if hasattr(self, "main_screen") and hasattr(self.main_screen, "process_group_created_event"):
             self.main_screen.process_group_created_event(data)
         else:
-            print("[GROUPS] Обновление группы будет загружено при следующем входе")
+            logger.warning("ws.group.invitation.deferred reason=receiver_unavailable")
 
     def _on_group_member_joined(self, data: dict):
         if hasattr(self, "main_screen") and hasattr(self.main_screen, "process_group_member_joined"):
@@ -2208,6 +2298,9 @@ class AppWindow(QMainWindow):
             self.main_screen.process_group_sender_key_updated(data)
 
     def _on_groups_fetched(self, success: bool, data, worker):
+        import logging
+
+        logger = logging.getLogger("max1m.delivery")
         worker.wait()
         if worker is not self.groups_fetch_worker:
             return
@@ -2215,13 +2308,14 @@ class AppWindow(QMainWindow):
             return
         self.groups_fetch_worker = None
         if not success:
-            print(f"[GROUPS] Ошибка загрузки групп: {data}")
+            logger.warning("groups.fetch.failed result_type=%s", type(data).__name__)
             return
 
         if not isinstance(data, list):
+            logger.warning("groups.fetch.failed reason=invalid_response_shape")
             return
 
-        print(f"[GROUPS] Загружено групп: {len(data)}")
+        logger.info("groups.fetch.completed count=%d", len(data))
 
         server_ids = set()
         for group_info in data:

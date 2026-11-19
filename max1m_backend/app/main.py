@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 import uvicorn
 from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, Request
@@ -118,6 +119,63 @@ app = FastAPI(
     openapi_url="/openapi.json" if settings.ENABLE_API_DOCS else None,
 )
 
+_MESSAGE_ROUTE_LABELS = {
+    "/messages/send": "send",
+    "/messages/send-reliable": "send_reliable",
+    "/messages/sync-safe": "sync_safe",
+    "/messages/ack": "ack",
+}
+
+
+class MessageRequestLifecycleMiddleware:
+    """Pure ASGI request timing for message routes; never reads request bodies."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        route = _MESSAGE_ROUTE_LABELS.get(scope.get("path"))
+        if route is None:
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method") if scope.get("method") in {"GET", "POST"} else "OTHER"
+        started = time.perf_counter()
+        response_status = None
+        logged_completion = False
+        logger.info("http.message.started method=%s route=%s", method, route)
+
+        def log_completed(status_code):
+            nonlocal logged_completion
+            if not logged_completion:
+                logged_completion = True
+                logger.info("http.message.completed method=%s route=%s status=%d elapsed_ms=%d",
+                            method, route, status_code,
+                            int((time.perf_counter() - started) * 1000))
+
+        async def send_with_status(message):
+            nonlocal response_status
+            if message.get("type") == "http.response.start":
+                response_status = message.get("status")
+            await send(message)
+            if (message.get("type") == "http.response.body"
+                    and not message.get("more_body", False)
+                    and isinstance(response_status, int)):
+                log_completed(response_status)
+
+        try:
+            await self.app(scope, receive, send_with_status)
+        except Exception as exc:
+            logger.error("http.message.failed method=%s route=%s error_type=%s",
+                         method, route, type(exc).__name__)
+            raise
+        if isinstance(response_status, int):
+            log_completed(response_status)
+
+
 # ── Rate limit exceeded handler ────────────────────────────────────────────────
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -138,6 +196,7 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(MessageBodyLimitMiddleware)
 app.add_middleware(GeneralBodyLimitMiddleware)
 app.add_middleware(UploadBodyLimitMiddleware)
+app.add_middleware(MessageRequestLifecycleMiddleware)
 
 
 @app.exception_handler(RequestValidationError)

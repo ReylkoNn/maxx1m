@@ -198,6 +198,7 @@ def test_desktop_group_list_worker_accepts_real_server_response(group, monkeypat
         return module
     load('app.media_identity', 'media_identity.py')
     load('app.client_api', 'client_api.py')
+    load('app.diagnostics', 'diagnostics.py')
     load('app.delivery', 'delivery.py')
     workers = load('desktop_test_workers', 'workers.py')
     class Adapter:

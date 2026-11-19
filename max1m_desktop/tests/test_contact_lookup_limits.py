@@ -34,3 +34,30 @@ def test_lookup_rejects_bad_path_and_large_or_ambiguous_result(monkeypatch):
         assert not api.find_user('https://server', 'token', 'bob')[0] and response.closed
     response = Response(b'bad body', status=302)
     assert not api.find_user('https://server', 'token', 'bob')[0] and response.closed
+
+
+def test_online_device_lookup_is_bounded_and_validated(monkeypatch):
+    calls = []
+    response = Response(json.dumps({
+        'username': 'bob', 'online_device_ids': ['phone-1', 'laptop_2'], 'ignored': 'data',
+    }).encode())
+    monkeypatch.setattr('app.client_api.requests.get', lambda url, **kw: calls.append((url, kw)) or response)
+    ok, ids = APIClient().get_online_devices('https://server/', 'token', '@bob')
+    assert ok and ids == ['phone-1', 'laptop_2']
+    assert calls[0][0] == 'https://server/auth/online-devices/bob'
+    assert calls[0][1]['stream'] and not calls[0][1]['allow_redirects'] and response.closed
+
+    for body in (
+        {'username': 'eve', 'online_device_ids': ['phone-1']},
+        {'username': 'bob', 'online_device_ids': ['../other']},
+        {'username': 'bob', 'online_device_ids': ['phone-1', 'phone-1']},
+        {'username': 'bob', 'online_device_ids': ['x' * 65]},
+        {'username': 'bob', 'online_device_ids': ['x'] * 257},
+    ):
+        response = Response(json.dumps(body).encode())
+        assert not APIClient().get_online_devices('https://server', 'token', 'bob')[0]
+        assert response.closed
+
+    response = Response(b'{"detail":"not found"}', status=404)
+    assert not APIClient().get_online_devices('https://server', 'token', 'bob')[0]
+    assert response.closed

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from app import models
+from app.api.messages import manager
 from app.config import Settings, settings, validate_secret_key
 from app.database import AsyncSessionLocal
 from app.main import app
@@ -136,6 +137,51 @@ def test_list_own_devices_and_revoke_closes_ws_and_hides_from_lookup():
         assert lookup.status_code == 200, lookup.text
         found_ids = [d["device_id"] for d in lookup.json()["devices"]]
         assert found_ids == [dev1_id, dev3_id]
+
+
+def test_online_device_lookup_reports_only_connected_active_devices(monkeypatch):
+    with TestClient(app) as client:
+        username = f"presence_{uuid.uuid4().hex[:10]}"
+        dev1_id, token = _register_and_login(client, username)
+        second = _login_new_device(client, username, "Second Device")
+        assert second.status_code == 200, second.text
+        dev2_id = second.json()["device_id"]
+
+        # The endpoint reports only connections in this relay process, but must
+        # intersect that in-memory presence with non-revoked database devices.
+        monkeypatch.setitem(manager.active_connections, dev1_id, object())
+        monkeypatch.setitem(manager.active_connections, dev2_id, object())
+        response = client.get(
+            f"/auth/online-devices/{username}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"username": username, "online_device_ids": [dev1_id, dev2_id]}
+
+        revoked = client.post(
+            f"/auth/devices/{dev2_id}/revoke",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert revoked.status_code == 200, revoked.text
+        # Even if the in-memory manager has a stale entry, revoked devices are
+        # excluded by the database-side active-device filter.
+        monkeypatch.setitem(manager.active_connections, dev2_id, object())
+        response = client.get(
+            f"/auth/online-devices/{username}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"username": username, "online_device_ids": [dev1_id]}
+
+        missing = client.get(
+            f"/auth/online-devices/missing_{uuid.uuid4().hex[:12]}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert missing.status_code == 404
+        assert missing.json() == client.get(
+            f"/auth/online-devices/invalid-name!",
+            headers={"Authorization": f"Bearer {token}"},
+        ).json()
 
 
 def test_cannot_revoke_current_device_or_foreign_device():

@@ -102,8 +102,10 @@ def newly_advertised_devices(existing: dict, incoming: dict, allies: dict, usern
     if not existing.get("user_id") or existing.get("user_id") != incoming.get("user_id"):
         raise ValueError("Contact identity changed")
     old, new = device_key_map(existing), device_key_map(incoming)
-    if any(new.get(device_id) != key for device_id, key in old.items()):
-        raise ValueError("Existing keys or devices changed")
+    # Revoked devices may disappear from the server directory. Keep their
+    # local records and verification state; only reject an advertised key change.
+    if any(device_id in new and new[device_id] != key for device_id, key in old.items()):
+        raise ValueError("Existing device key changed")
     used_elsewhere = {device.get("device_id") for name, contact in allies.items() if name != username
                       for device in contact.get("devices", [])}
     additions = []
@@ -113,3 +115,63 @@ def newly_advertised_devices(existing: dict, incoming: dict, allies: dict, usern
                 raise ValueError("Device already belongs to another contact")
             additions.append({k: v for k, v in device.items() if k not in {"verified_fingerprint", "verified_scope"}})
     return additions
+
+
+def add_unverified_sender_device(allies: dict, username: str, user_id: str,
+                                 sender_device_id: str, incoming: dict) -> tuple[dict, bool]:
+    """Merge one relay-resolved sender device into a known contact, unverified.
+
+    The relay metadata is only used to locate a key candidate. Existing keys,
+    contact ownership, and user verification are never overwritten or inferred.
+    """
+    if (not isinstance(allies, dict) or not isinstance(username, str) or not username
+            or not isinstance(user_id, str) or not user_id
+            or not isinstance(sender_device_id, str) or not sender_device_id):
+        raise ValueError("Invalid sender directory context")
+    if not isinstance(incoming, dict) or incoming.get("username") != username or incoming.get("user_id") != user_id:
+        raise ValueError("Sender account identity changed")
+    existing = allies.get(username)
+    if not isinstance(existing, dict) or existing.get("user_id") != user_id:
+        raise ValueError("Contact identity changed")
+
+    old_keys = device_key_map(existing)
+    advertised_keys = device_key_map(incoming)
+    if any(device_id in advertised_keys and advertised_keys[device_id] != key
+           for device_id, key in old_keys.items()):
+        raise ValueError("Existing device key changed")
+
+    target = next((device for device in incoming["devices"]
+                   if device.get("device_id") == sender_device_id), None)
+    if target is None:
+        raise ValueError("Sender device is not in the active directory")
+
+    matches = [
+        (contact_name, device)
+        for contact_name, contact in allies.items()
+        if isinstance(contact, dict)
+        for device in contact.get("devices", [])
+        if isinstance(device, dict) and device.get("device_id") == sender_device_id
+    ]
+    if matches:
+        if (len(matches) == 1 and matches[0][0] == username
+                and matches[0][1].get("public_key") == advertised_keys[sender_device_id]):
+            return allies, False
+        raise ValueError("Sender device is mapped ambiguously")
+
+    # Validate collisions against every other locally stored contact before
+    # publishing the fetched key candidate.
+    for contact_name, contact in allies.items():
+        if contact_name == username or not isinstance(contact, dict):
+            continue
+        for device in contact.get("devices", []):
+            if isinstance(device, dict) and device.get("device_id") == sender_device_id:
+                raise ValueError("Sender device belongs to another contact")
+
+    candidate = {
+        key: target[key]
+        for key in ("device_id", "device_name", "public_key", "fingerprint")
+        if key in target
+    }
+    updated_contact = {**existing, "devices": [*existing["devices"], candidate]}
+    updated_allies = {**allies, username: updated_contact}
+    return updated_allies, True

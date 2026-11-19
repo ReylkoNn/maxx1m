@@ -139,6 +139,8 @@ def test_safe_sync_retries_until_ack_and_respects_recipient(account):
     own_headers = headers(user_id, device_id)
     first = client.get("/messages/sync-safe", headers=own_headers).json()
     assert len(first) == 100
+    assert all(message["sender_username"] == "auth_user" for message in first)
+    assert all(message["sender_user_id"] == user_id for message in first)
     assert first == client.get("/messages/sync-safe", headers=own_headers).json()
     assert client.post("/messages/ack", headers=own_headers,
                        json={"message_ids": [first[0]["id"], "other-message"]}).status_code == 200
@@ -171,6 +173,22 @@ def test_websocket_header_auth_and_no_credential_url(account):
     with client.websocket_connect(f"/messages/ws/{device_id}", headers={"Authorization": "Bearer " + token}) as ws:
         ws.send_json({"type": "call_offer", "to_device_id": device_id})
         assert ws.receive_json()["type"] == "call_offer"
+        sent = client.post("/messages/send", headers=headers(user_id, device_id), json={
+            "receiver_device_id": device_id, "encrypted_blob": "ciphertext", "signature": "signature",
+        })
+        assert sent.status_code == 200
+        event = ws.receive_json()
+        assert event["type"] == "new_message"
+        assert event["sender_user_id"] == user_id
+        assert event["sender_username"] == "auth_user"
+        client.post("/messages/ack", headers=headers(user_id, device_id),
+                    json={"message_ids": [sent.json()["id"]]})
+        async def remove_test_message():
+            from sqlalchemy import delete
+            async with AsyncSessionLocal() as db:
+                await db.execute(delete(models.Message).where(models.Message.id == sent.json()["id"]))
+                await db.commit()
+        client.portal.call(remove_test_message)
     with pytest.raises(WebSocketDisconnect):
         with client.websocket_connect(f"/messages/ws/{device_id}"):
             pass
@@ -202,6 +220,8 @@ def test_reliable_send_is_idempotent_and_scoped_to_sender(account):
                "encrypted_blob": "ciphertext", "signature": "sig"}
     first = client.post("/messages/send-reliable", headers=headers(user_id, sender), json=payload)
     assert first.status_code == 200, first.text
+    assert first.json()["sender_user_id"] == user_id
+    assert first.json()["sender_username"] == "auth_user"
     second = client.post("/messages/send-reliable", headers=headers(user_id, sender), json=payload)
     assert second.status_code == 200 and second.json()["id"] == first.json()["id"] == mid
     assert client.post("/messages/send-reliable", headers=headers(user_id, sender),

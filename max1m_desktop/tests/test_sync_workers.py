@@ -133,8 +133,9 @@ def test_sync_rejects_more_than_requested_page(monkeypatch):
     assert len(events) == 1 and not events[0][0]
 
 
-def test_websocket_connection_errors_never_print_credentials(monkeypatch, capsys):
+def test_websocket_connection_errors_never_log_credentials(monkeypatch, caplog):
     import asyncio
+    import logging
     from app.workers import WebSocketWorker
     secret='bearer-secret-do-not-print'
     worker=WebSocketWorker('https://example.test',secret,'device')
@@ -142,9 +143,9 @@ def test_websocket_connection_errors_never_print_credentials(monkeypatch, capsys
         worker._is_running=False
         raise RuntimeError('sensitive authorization: '+secret)
     monkeypatch.setattr('app.workers.websockets.connect',connect)
-    asyncio.run(worker._connect_loop())
-    captured=capsys.readouterr()
-    assert 'RuntimeError' in captured.out and secret not in captured.out+captured.err
+    with caplog.at_level(logging.INFO, logger='max1m.delivery'):
+        asyncio.run(worker._connect_loop())
+    assert 'RuntimeError' in caplog.text and secret not in caplog.text
 
 
 def test_sync_and_ack_close_exception_emit_exactly_one_failure(monkeypatch):

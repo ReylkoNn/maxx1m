@@ -62,3 +62,42 @@ def test_worker_without_sender_identity_fails_closed(monkeypatch):
     worker.finished.connect(lambda success, data: emitted.append((success, data)))
     worker.run()
     assert emitted and emitted[0][0] is False
+
+
+def test_reliable_send_logs_correlatable_tags_without_payload_or_credentials(monkeypatch, caplog):
+    import logging
+    from app.diagnostics import safe_identifier_tag
+
+    client_id = "12345678-1234-4234-8234-123456789abc"
+    sender_id = "sender-device-private-id"
+    recipient_id = "recipient-device-private-id"
+    token = "never-log-this-token"
+    ciphertext = "never-log-this-ciphertext"
+    signature = "never-log-this-signature"
+    payload = {
+        "client_message_id": client_id,
+        "receiver_device_id": recipient_id,
+        "encrypted_blob": ciphertext,
+        "signature": signature,
+    }
+    response = Response({
+        "id": client_id,
+        "sender_device_id": sender_id,
+        "receiver_device_id": recipient_id,
+        "encrypted_blob": ciphertext,
+        "signature": signature,
+    })
+    monkeypatch.setattr(client_api.requests, "post", lambda *args, **kwargs: response)
+
+    with caplog.at_level(logging.INFO, logger="max1m.delivery"):
+        ok, _ = client_api.APIClient().send_reliable_message(
+            "https://node.example", token, payload, sender_id
+        )
+
+    assert ok and response.closed
+    assert safe_identifier_tag(client_id) in caplog.text
+    assert safe_identifier_tag(sender_id) in caplog.text
+    assert safe_identifier_tag(recipient_id) in caplog.text
+    for sensitive in (client_id, sender_id, recipient_id, token, ciphertext, signature):
+        assert sensitive not in caplog.text
+    assert "send.http.started" in caplog.text and "send.http.accepted" in caplog.text

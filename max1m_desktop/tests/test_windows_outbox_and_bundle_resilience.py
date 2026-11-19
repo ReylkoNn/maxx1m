@@ -3,9 +3,9 @@ Regression tests for Windows `Max1m.exe` message sending & atomic queue resilien
 1. Transient Windows Defender (`WdFilter.sys`) `PermissionError` (`winerror=5` / `32`)
    during `os.replace` in `outbox.enqueue` and `SecureStorage.save_allies` is retried
    cleanly without failing message send or leaving orphan temp files.
-2. `_encrypt_durable_personal` and `_encrypt_attachment_personal` fall back cleanly to
-   signed NaCl Box if Double Ratchet import/store raises unexpectedly, rather than
-   aborting `_send_system_payload` with "Сообщение не отправлено".
+2. Durable encryption falls back to signed NaCl Box only when the optional
+   Double Ratchet module cannot be imported; an active-session failure must fail
+   closed rather than produce an envelope the recipient cannot decrypt.
 3. `edit_msg` and `pin_msg` trigger `_verify_call_contact` when an ally device has not
    yet been verified, matching `_send_ally_text_message`.
 """
@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import keyring
 from keyring.backend import KeyringBackend
 
@@ -152,6 +153,112 @@ def test_encrypt_durable_personal_falls_back_to_nacl_box_if_double_ratchet_unava
     assert bob.verify_signature(att_res["encrypted_blob"], att_res["signature"], alice.get_public_key_b64())
     dec_att = bob.decrypt_message(att_res["encrypted_blob"], alice.get_public_key_b64())
     assert json.loads(dec_att)["type"] == "image"
+
+
+@pytest.mark.parametrize("method_name", ["_encrypt_durable_personal", "_encrypt_attachment_personal"])
+def test_durable_callers_do_not_downgrade_ratchet_failure(monkeypatch, caplog, method_name):
+    import logging
+    import app.double_ratchet as dr
+
+    alice = CryptoManager()
+    alice.generate_new_keypair()
+    bob = CryptoManager()
+    bob.generate_new_keypair()
+    private_text = "private-message-body-must-not-be-logged"
+
+    def failed_ratchet(**_kwargs):
+        raise dr.DoubleRatchetEncryptionError("encrypt", "RuntimeError")
+
+    monkeypatch.setattr(dr, "encrypt_personal_envelope", failed_ratchet)
+    monkeypatch.setattr(
+        alice, "encrypt_message",
+        lambda *_args, **_kwargs: pytest.fail("must not downgrade after ratchet failure"),
+    )
+    methods = _extract_methods(
+        "app/windows/main_screen.py",
+        "MainScreen",
+        ["_encrypt_durable_personal", "_encrypt_attachment_personal"],
+        {"json": json, "crypto": alice},
+    )
+    screen = SimpleNamespace(
+        _ensure_peer_ratchet_session=lambda *_args: pytest.fail("session initialization must not mask failure")
+    )
+    ctx = RecipientContext(
+        username="bob",
+        device_id="bob-device-private-id",
+        public_key=bob.get_public_key_b64(),
+        owner_username="alice",
+        owner_device_id="alice-device-private-id",
+        server_url="https://relay.example",
+    )
+
+    with caplog.at_level(logging.INFO, logger="max1m.delivery"):
+        with pytest.raises(dr.DoubleRatchetEncryptionError):
+            if method_name == "_encrypt_durable_personal":
+                methods[method_name].__get__(screen)(
+                    ctx, {"type": "text", "text": private_text, "msg_id": "local-private-id"}, "text"
+                )
+            else:
+                methods[method_name].__get__(screen)(
+                    ctx,
+                    {"type": "image", "file_id": "private-file-id", "secret_key": "private-key"},
+                    "image", "private-file-id", "private-key", "local-private-id",
+                )
+
+    assert "send.encrypt.failed" in caplog.text
+    assert "stage=encrypt" in caplog.text
+    for secret in (private_text, "bob-device-private-id", "alice-device-private-id",
+                   "local-private-id", "private-file-id", "private-key"):
+        assert secret not in caplog.text
+
+
+def test_outbox_ack_failure_keeps_queue_and_does_not_mark_message_sent(monkeypatch, caplog):
+    import logging
+    from pathlib import Path
+    from app.diagnostics import safe_identifier_tag
+
+    message_id = "12345678-1234-4234-8234-123456789abc"
+
+    class Worker:
+        payload = {"client_message_id": message_id}
+        queue_path = Path("/outbox/pending.enc")
+        queue_username = "alice"
+        queue_server = "https://relay.example"
+        queue_device = "alice-device-private-id"
+        local_history = {"ally_username": "bob", "msg_id": "local-message-private-id"}
+
+        def wait(self):
+            return True
+
+    class Outbox:
+        @staticmethod
+        def acknowledge(*_args):
+            raise OSError("private storage detail")
+
+    methods = _extract_methods(
+        "app/windows/main_screen.py",
+        "MainScreen",
+        ["_on_outbox_finished"],
+        {"outbox": Outbox, "state": SimpleNamespace(),
+         "QTimer": SimpleNamespace(singleShot=lambda *_args: None)},
+    )
+    worker = Worker()
+    screen = SimpleNamespace(
+        _outbox_worker=worker,
+        _outbox_skipped=set(),
+        _try_outbox=lambda: None,
+        messages_layout=SimpleNamespace(count=lambda: pytest.fail("must not mark unsaved queue state")),
+    )
+
+    with caplog.at_level(logging.INFO, logger="max1m.delivery"):
+        methods["_on_outbox_finished"].__get__(screen)(True, {}, worker)
+
+    assert screen._outbox_worker is None
+    assert worker.queue_path.name in screen._outbox_skipped
+    assert "outbox.queue.ack_failed" in caplog.text
+    assert safe_identifier_tag(message_id) in caplog.text
+    for secret in (message_id, "alice-device-private-id", "local-message-private-id", "private storage detail"):
+        assert secret not in caplog.text
 
 
 def test_latest_python_314_315_windows_wheels_and_pyaudiowpatch_fallback():

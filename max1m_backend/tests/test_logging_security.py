@@ -1,13 +1,21 @@
 import logging
-from app.logging_security import TokenRedactionFilter, install_uvicorn_token_filter
+from app.logging_security import TokenRedactionFilter, install_uvicorn_token_filter, safe_identifier_tag
 
 
 def test_redacts_token_in_formatted_websocket_url():
     record = logging.LogRecord("uvicorn.error", logging.INFO, __file__, 1,
         'WebSocket %s accepted', ('/messages/ws/id?token=secret.jwt&other=ok',), None)
     assert TokenRedactionFilter().filter(record)
-    assert record.getMessage() == 'WebSocket /messages/ws/id?token=[REDACTED]&other=ok accepted'
+    assert record.getMessage() == 'WebSocket /messages/ws/[DEVICE]?token=[REDACTED]&other=ok accepted'
     assert 'secret.jwt' not in str(record.args)
+    assert '/messages/ws/id' not in record.getMessage()
+
+
+def test_identifier_tags_are_short_and_do_not_reveal_input():
+    value = "full-device-id-that-must-not-appear"
+    tag = safe_identifier_tag(value)
+    assert len(tag) == 12 and tag != value
+    assert safe_identifier_tag(value) == tag
 
 
 def test_filter_install_is_idempotent():
