@@ -7398,6 +7398,16 @@ class MainScreen(QFrame):
         if actual == "connected":
             self._cw_status.setText("На связи")
             self._cs_screen_btn.setVisible(True)
+        elif actual == "webrtc_unavailable":
+            QMessageBox.warning(
+                self,
+                "WebRTC недоступен",
+                "В этой среде не загружается библиотека WebRTC (aiortc). "
+                "Звонки не будут работать. Запустите клиент на Python 3.11–3.13 "
+                "со всеми зависимостями из requirements или используйте готовую Windows-сборку.",
+            )
+            rtc.end_call()
+            self._cleanup_call()
         elif actual == "audio_unavailable":
             QMessageBox.warning(
                 self,

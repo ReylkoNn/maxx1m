@@ -100,6 +100,10 @@ class AudioDeviceUnavailableError(RuntimeError):
     """Raised when a voice call cannot open its local microphone/speaker streams."""
 
 
+class WebRTCUnavailableError(RuntimeError):
+    """Raised when aiortc could not be imported in this Python environment."""
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SIGNAL CRYPTO — E2EE for SDP / ICE / screen control
 # ═════════════════════════════════════════════════════════════════════════════
@@ -929,6 +933,7 @@ class WebRTCManager:
 
         self.audio_io = PyAudioIO()
         self.screen = ScreenShareManager()
+        self._aiortc_available = AIORTC_AVAILABLE
 
         self.is_muted = False
         self.is_deafened = False
@@ -1057,6 +1062,8 @@ class WebRTCManager:
     # ─── Voice calls ──────────────────────────────────────────────────────────
 
     async def _create_voice_session(self, peer_id: str, call_id: str) -> VoicePeerSession:
+        if not getattr(self, "_aiortc_available", True):
+            raise WebRTCUnavailableError("aiortc is not available in this environment")
         existing = self._voice_peers.get(peer_id)
         if existing and getattr(existing, "call_id", None) == call_id:
             return existing
@@ -1189,7 +1196,9 @@ class WebRTCManager:
                 self._emit_state(
                     to_device_id,
                     call_id,
-                    "audio_unavailable" if isinstance(e, AudioDeviceUnavailableError) else "failed",
+                    "webrtc_unavailable" if isinstance(e, WebRTCUnavailableError)
+                    else "audio_unavailable" if isinstance(e, AudioDeviceUnavailableError)
+                    else "failed",
                 )
 
     async def _handle_voice_offer(self, from_id: str, call_id: str, sdp: str):
@@ -1230,7 +1239,9 @@ class WebRTCManager:
                 self._emit_state(
                     from_id,
                     call_id,
-                    "audio_unavailable" if isinstance(e, AudioDeviceUnavailableError) else "failed",
+                    "webrtc_unavailable" if isinstance(e, WebRTCUnavailableError)
+                    else "audio_unavailable" if isinstance(e, AudioDeviceUnavailableError)
+                    else "failed",
                 )
 
     async def _handle_voice_answer(self, from_id: str, call_id: str, sdp: str):
@@ -1315,6 +1326,8 @@ class WebRTCManager:
     # ─── Public Call Entrypoints ──────────────────────────────────────────────
 
     def start_call(self, to_device_id: str, call_id: str):
+        if not getattr(self, "_aiortc_available", True):
+            raise WebRTCUnavailableError("aiortc is not available in this environment")
         self._lifecycle.activate(to_device_id, call_id)
         self.call_state = CALL_STATE_CALLING
         try:
@@ -1331,6 +1344,8 @@ class WebRTCManager:
             raise
 
     def prepare_incoming_call(self, from_device_id: str, call_id: str):
+        if not getattr(self, "_aiortc_available", True):
+            raise WebRTCUnavailableError("aiortc is not available in this environment")
         self._lifecycle.activate(from_device_id, call_id)
         self.call_state = CALL_STATE_CONNECTING
 
