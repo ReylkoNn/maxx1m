@@ -47,6 +47,28 @@ except Exception:
 
 logger = logging.getLogger("max1m.group_voice")
 
+WEBRTC_UNAVAILABLE_MESSAGE = (
+    "WebRTC недоступен: библиотека aiortc не загрузилась в этой среде "
+    "(не хватает нативной DLL). Голосовые комнаты и звонки работать не будут. "
+    "Запустите клиент на Python 3.12–3.13 со всеми зависимостями из "
+    "requirements.txt или используйте готовую Windows-сборку."
+)
+
+
+def friendly_webrtc_error(exc: BaseException) -> str:
+    """Map raw aiortc/av import failures to a human-readable explanation.
+
+    A broken WebRTC stack (e.g. ``DLL load failed while importing _rust``)
+    must never be shown to the user verbatim: it looks like a crash and
+    gives no hint that the Python environment is at fault.
+    """
+    text = str(exc) or type(exc).__name__
+    lowered = text.lower()
+    if isinstance(exc, ImportError) or "dll load failed" in lowered or "aiortc" in lowered or "_rust" in lowered:
+        return WEBRTC_UNAVAILABLE_MESSAGE
+    return text
+
+
 RATE = 48000
 CHANNELS = 1
 CHUNK_MS = 20
@@ -1022,7 +1044,7 @@ class GroupVoiceRoomController:
         except Exception as exc:
             logger.warning("Group voice offer failed (%s): %s", peer_id, exc)
             if self._on_error:
-                self._on_error(str(exc))
+                self._on_error(friendly_webrtc_error(exc))
 
     def handle_incoming_signal(self, event: dict) -> bool:
         """
@@ -1085,8 +1107,14 @@ class GroupVoiceRoomController:
         return False
 
     async def _apply_voice_signal(self, group_id: str, peer_id: str, peer_pub: str, data: dict) -> None:
-        from aiortc import RTCSessionDescription
-        from aiortc.sdp import candidate_from_sdp
+        try:
+            from aiortc import RTCSessionDescription
+            from aiortc.sdp import candidate_from_sdp
+        except Exception as exc:
+            logger.warning("Group voice WebRTC import failed: %s", exc)
+            if self._on_error:
+                self._on_error(friendly_webrtc_error(exc))
+            return
 
         action = data.get("action")
         relay_only = ice_relay_only()
@@ -1135,6 +1163,8 @@ class GroupVoiceRoomController:
                     self._voice_pending_ice.setdefault(peer_id, []).append(cand)
         except Exception as exc:
             logger.warning("Group voice signal apply error (%s/%s): %s", peer_id, action, exc)
+            if isinstance(exc, ImportError) and self._on_error:
+                self._on_error(friendly_webrtc_error(exc))
 
     # ── 1-Click Peer Screen Share (Isolated RTCPeerConnection on _screen_loop) ──
 

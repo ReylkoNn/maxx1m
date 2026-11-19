@@ -65,6 +65,10 @@ try:
     AIORTC_AVAILABLE = True
 except ImportError as _e:
     AIORTC_AVAILABLE = False
+    # Keep the full traceback in client.log: "DLL load failed while importing
+    # _rust" alone does not say which package (cryptography/aiortc/av) is
+    # broken, and that detail decides how the environment must be repaired.
+    logger.warning("aiortc import failed: %s", _e, exc_info=True)
     MediaStreamTrack = object
     RTCPeerConnection = object
     RTCSessionDescription = object
