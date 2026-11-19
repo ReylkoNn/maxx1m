@@ -4828,20 +4828,39 @@ class MainScreen(QFrame):
             self._refresh_group_voice_bar()
 
     def open_settings(self):
-        if self.settings_screen is None:
-            from app.windows.settings_screen import SettingsScreen
-            self.settings_screen = SettingsScreen()
-            self.settings_screen.close_requested.connect(self.close_settings)
-            if hasattr(self.settings_screen, "logout_requested"):
-                self.settings_screen.logout_requested.connect(self.logout_requested.emit)
-            if hasattr(self.settings_screen, "call_audio_prefs_changed"):
-                self.settings_screen.call_audio_prefs_changed.connect(self.on_call_audio_prefs_changed)
-            if hasattr(self.settings_screen, "audio_devices_changed"):
-                self.settings_screen.audio_devices_changed.connect(self.on_audio_devices_changed)
-            self.right_stack.addWidget(self.settings_screen)
-        if hasattr(self.settings_screen, "refresh"):
-            self.settings_screen.refresh()
+        import logging
+
+        logger = logging.getLogger("max1m.delivery")
+        try:
+            if self.settings_screen is None:
+                from app.windows.settings_screen import SettingsScreen
+                self.settings_screen = SettingsScreen()
+                self.settings_screen.close_requested.connect(self.close_settings)
+                if hasattr(self.settings_screen, "logout_requested"):
+                    self.settings_screen.logout_requested.connect(self.logout_requested.emit)
+                if hasattr(self.settings_screen, "call_audio_prefs_changed"):
+                    self.settings_screen.call_audio_prefs_changed.connect(self.on_call_audio_prefs_changed)
+                if hasattr(self.settings_screen, "audio_devices_changed"):
+                    self.settings_screen.audio_devices_changed.connect(self.on_audio_devices_changed)
+                self.right_stack.addWidget(self.settings_screen)
+        except Exception as exc:
+            logger.error("settings.open.failed stage=create error_type=%s", type(exc).__name__)
+            QMessageBox.warning(
+                self, "Настройки недоступны",
+                "Не удалось открыть настройки. Приложение продолжает работать; "
+                "подробности записаны в журнал диагностики.",
+            )
+            return
+        # A failing refresh (for example, a broken audio driver while
+        # populating device selectors) must not make the gear button look
+        # dead: still show the settings screen.
+        try:
+            if hasattr(self.settings_screen, "refresh"):
+                self.settings_screen.refresh()
+        except Exception as exc:
+            logger.error("settings.open.failed stage=refresh error_type=%s", type(exc).__name__)
         self.right_stack.setCurrentWidget(self.settings_screen)
+        logger.info("settings.open.completed")
 
     def reset_session_view(self):
         gvc = getattr(self, "_group_voice_ctrl", None)

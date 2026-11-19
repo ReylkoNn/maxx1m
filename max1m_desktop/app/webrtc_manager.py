@@ -534,7 +534,14 @@ class PyAudioIO:
             return {"inputs": [], "outputs": []}
         inputs, outputs = [], []
         seen_in, seen_out = set(), set()
-        for i in range(self.pa.get_device_count()):
+        try:
+            device_count = self.pa.get_device_count()
+        except Exception as exc:
+            # A broken Windows audio endpoint/driver must never make the
+            # settings screen (or any other caller) fail to open.
+            logger.warning("Audio device enumeration failed: %s", type(exc).__name__)
+            return {"inputs": [], "outputs": []}
+        for i in range(device_count):
             try:
                 info = self.pa.get_device_info_by_index(i)
             except Exception:

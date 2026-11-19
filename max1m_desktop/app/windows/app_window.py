@@ -205,8 +205,21 @@ class TitleBar(QFrame):
         self.theme_btn.refresh_theme()
 
     def _open_settings(self):
-        if hasattr(self.parent_window, "main_screen"):
-            self.parent_window.main_screen.open_settings()
+        import logging
+
+        logger = logging.getLogger("max1m.delivery")
+        screen = getattr(self.parent_window, "main_screen", None)
+        if screen is None or not hasattr(screen, "open_settings"):
+            logger.warning("settings.open.rejected reason=main_screen_unavailable")
+            return
+        # The title bar is also visible on the auth/loading screens. Opening
+        # settings inside the hidden main screen there made the gear look
+        # dead; only react while the main screen is actually shown.
+        stack = getattr(self.parent_window, "stack", None)
+        if stack is not None and hasattr(stack, "currentWidget") and stack.currentWidget() is not screen:
+            logger.info("settings.open.ignored reason=main_screen_not_visible")
+            return
+        screen.open_settings()
 
     def _cycle_theme(self):
         from PySide6.QtWidgets import QApplication

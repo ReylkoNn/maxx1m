@@ -944,7 +944,17 @@ class SettingsScreen(QFrame):
         self.call_audio_prefs_changed.emit(_sec_storage.get_call_audio_prefs(state.username))
 
     def _populate_audio_combos(self):
-        devices = rtc.get_audio_devices()
+        try:
+            devices = rtc.get_audio_devices()
+            if not isinstance(devices, dict):
+                devices = {}
+        except Exception as exc:
+            # Settings must open even when the local audio stack is broken;
+            # only the device selectors stay empty.
+            print(f"[Settings] Audio devices unavailable: {type(exc).__name__}")
+            devices = {}
+            if hasattr(self, "audio_status"):
+                self.audio_status.setText("Аудиоустройства недоступны. Остальные настройки работают.")
 
         # ВАЖНО: блокируем сигналы при заполнении, чтобы не ломать звонок
         self.mic_combo.blockSignals(True)
