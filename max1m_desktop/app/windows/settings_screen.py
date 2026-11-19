@@ -424,7 +424,6 @@ class SettingsScreen(QFrame):
         vault_btn_row.addWidget(self.panic_wipe_btn)
         vault_btn_row.addStretch()
 
-        from PySide6.QtWidgets import QCheckBox
         self.private_notif_cb = QCheckBox(
             "Приватные уведомления (скрывать имя отправителя и текст сообщений)"
         )

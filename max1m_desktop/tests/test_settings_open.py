@@ -122,6 +122,27 @@ def test_titlebar_settings_ignores_clicks_before_main_screen_is_visible():
     assert calls == [True]
 
 
+def test_security_tab_does_not_shadow_global_qcheckbox_import():
+    # Regression from a real client log: a late
+    # `from PySide6.QtWidgets import QCheckBox` at the bottom of
+    # _build_security_tab made QCheckBox a local variable for the whole
+    # method, so its first use raised UnboundLocalError and the settings
+    # screen never opened.
+    path = DESKTOP_ROOT / "app/windows/settings_screen.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    methods = [
+        node for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == "SettingsScreen"
+        for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "_build_security_tab"
+    ]
+    assert len(methods) == 1
+    local_imports = [
+        alias.name
+        for node in ast.walk(methods[0]) if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    ]
+    assert "QCheckBox" not in local_imports
+
+
 def test_audio_device_enumeration_failure_returns_empty_lists():
     env = {"logger": SimpleNamespace(warning=lambda *args: None)}
     enumerate_devices = _extract("app/webrtc_manager.py", "PyAudioIO", "enumerate_devices", env)
