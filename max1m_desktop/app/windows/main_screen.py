@@ -4235,11 +4235,16 @@ class MainScreen(QFrame):
         logger = logging.getLogger("max1m.delivery")
         msg_type = payload_dict.get("type") if isinstance(payload_dict, dict) else None
         kind = safe_message_kind(msg_type)
-        durable = msg_type in {"text", "image", "voice", "file", "delete_msg", "edit_msg", "pin_msg"}
+        # read_ack must be durable too: it is the only signal that turns the
+        # sender's single tick into a read confirmation. A fire-and-forget
+        # receipt lost to a transient network failure could never be resent,
+        # because the messages are already marked read locally.
+        durable = msg_type in {"text", "image", "voice", "file", "delete_msg", "edit_msg", "pin_msg", "read_ack"}
+        warn_user = durable and msg_type != "read_ack"
         ally_data = state.allies.get(receiver_username)
         if not ally_data or not ally_data.get("devices"):
             logger.warning("send.prepare.rejected reason=recipient_not_found kind=%s", kind)
-            if durable:
+            if warn_user:
                 QMessageBox.warning(self, "Сообщение не отправлено", "Не найдено устройство получателя. Проверьте контакт.")
             return False
         failure_stage = "session_validation"
@@ -4283,7 +4288,8 @@ class MainScreen(QFrame):
                 if payload_chars > 1024 * 1024:
                     logger.warning("send.prepare.rejected reason=payload_too_large kind=%s chars=%d recipient_tag=%s",
                                    kind, payload_chars, recipient_tag)
-                    QMessageBox.warning(self, "Сообщение слишком большое", "Зашифрованное сообщение превышает лимит сервера 1 MiB.")
+                    if warn_user:
+                        QMessageBox.warning(self, "Сообщение слишком большое", "Зашифрованное сообщение превышает лимит сервера 1 MiB.")
                     return False
                 failure_stage = "outbox_enqueue"
                 client_id = outbox.enqueue(context.owner_username, context.server_url, context.owner_device_id,

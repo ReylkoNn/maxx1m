@@ -449,31 +449,37 @@ def test_live_receipt_targets_actual_verified_sender_device(monkeypatch):
     class Worker:
         def __init__(self,server,token,payload): self.server=server; self.token=token; self.payload=payload; self.finished=Signal(); workers.append(self)
         def start(self): pass
+    queued=[]
+    fake_outbox=SimpleNamespace(enqueue=lambda *a,**kw: queued.append(a[3]) or 'client-id')
     env={'state':state,'crypto':owner,'json':json,'recipient_is_verified':recipient_is_verified,'SendMessageWorker':Worker,
+         'outbox':fake_outbox,
          'QMessageBox':SimpleNamespace(warning=lambda *a:None),'Qt':SimpleNamespace(QueuedConnection=0)}
     method=extract_method('_send_system_payload',env)
     class Screen:
         _send_system_payload=method
         def __init__(self): self._net_workers=[]
         def _on_send_finished(self,*a): pass
+        def _try_outbox(self): pass
     screen=Screen(); account=('alice','https://node','mine','token')
+    # Read receipts are queued durably (not sent via the ephemeral worker), so
+    # a transient failure cannot silently strand the sender on one tick.
     assert screen._send_system_payload('bob',{'type':'read_ack','msg_ids':['m']},context=context,account_context=account)
-    assert len(workers)==1 and workers[0].payload['receiver_device_id']=='sender-device'
-    plaintext=sender.decrypt_message(workers[0].payload['encrypted_blob'],owner.get_public_key_b64())
+    assert len(workers)==0 and len(queued)==1 and queued[0]['receiver_device_id']=='sender-device'
+    plaintext=sender.decrypt_message(queued[0]['encrypted_blob'],owner.get_public_key_b64())
     assert json.loads(plaintext)=={'type':'read_ack','msg_ids':['m']}
-    with pytest.raises(Exception): other.decrypt_message(workers[0].payload['encrypted_blob'],owner.get_public_key_b64())
+    with pytest.raises(Exception): other.decrypt_message(queued[0]['encrypted_blob'],owner.get_public_key_b64())
     encrypt=owner.encrypt_message
     def change_session(*args):
         encrypted=encrypt(*args); state.token='new-token'; return encrypted
     monkeypatch.setattr(owner,'encrypt_message',change_session)
     assert not screen._send_system_payload('bob',{'type':'read_ack','msg_ids':['m']},context=context,account_context=account)
-    assert len(workers)==1
+    assert len(queued)==1
     state.token='token'
     def change_owner_key(*args):
         encrypted=encrypt(*args); owner.generate_new_keypair(); return encrypted
     monkeypatch.setattr(owner,'encrypt_message',change_owner_key)
     assert not screen._send_system_payload('bob',{'type':'read_ack','msg_ids':['m']},context=context,account_context=account)
-    assert len(workers)==1
+    assert len(queued)==1
 
 
 def test_real_verified_delivery_legacy_conflicting_id_is_not_acked(setup):

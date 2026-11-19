@@ -530,6 +530,32 @@ def test_delete_msg_is_queued_durably_and_verified_fail_closed(tmp_path, monkeyp
             },
         )
 
-    # read_ack still uses non-durable SendMessageWorker (does NOT bloat outbox)
+    # read_ack is durable too: a receipt lost in transit could otherwise never
+    # be resent (the messages are already marked read locally), leaving the
+    # sender stuck on a single tick forever.
     assert screen._send_system_payload("bob", {"type": "read_ack", "msg_ids": ["m1"]}) is True
-    assert len(ephemeral_workers) == 1
+    assert len(ephemeral_workers) == 0
+    assert len(outbox_tries) == 2
+    # Consume the delete_msg record queued above so the receipt is next.
+    _del_path, _del_record = outbox.next_message("alice", "https://relay.example", "alice-dev")
+    outbox.acknowledge(_del_path, "alice", "https://relay.example", "alice-dev",
+                       _del_record["client_message_id"])
+    queued_item = outbox.next_message("alice", "https://relay.example", "alice-dev")
+    assert queued_item is not None
+    _qpath, record = queued_item
+    assert "_local_history" not in record
+    verified_ctx = verify_queued_recipient(state, alice, record)
+    assert verified_ctx.username == "bob" and verified_ctx.device_id == "bob-dev"
+    decrypted = json.loads(bob.decrypt_message(record["encrypted_blob"], alice.get_public_key_b64()))
+    assert decrypted == {"type": "read_ack", "msg_ids": ["m1"]}
+    # Malformed receipts must stay queued, never be transmitted.
+    for bad in ({"type": "read_ack", "msg_ids": []},
+                {"type": "read_ack", "msg_ids": ["x" * 257]},
+                {"type": "read_ack", "msg_ids": ["m"], "extra": 1}):
+        bad_env = alice.encrypt_message(json.dumps(bad), bob_pub)
+        with pytest.raises(OutboxRecipientError):
+            verify_queued_recipient(
+                state, alice,
+                {"receiver_device_id": "bob-dev", "encrypted_blob": bad_env["encrypted_blob"],
+                 "signature": bad_env["signature"], "client_message_id": str(uuid.uuid4())},
+            )

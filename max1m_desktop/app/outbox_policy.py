@@ -83,6 +83,21 @@ def _verify_history_content(history, message):
             raise ValueError("invalid history expires_at")
 
 
+MAX_READ_ACK_IDS = 1024
+
+
+def _verify_read_ack(message, history, attachment_file_id):
+    """A queued read receipt carries only bounded message IDs, never history."""
+    msg_ids = message.get("msg_ids")
+    if (set(message) != {"type", "msg_ids"}
+            or not isinstance(msg_ids, list)
+            or not 1 <= len(msg_ids) <= MAX_READ_ACK_IDS
+            or any(not isinstance(item, str) or not 1 <= len(item) <= 256 for item in msg_ids)
+            or history is not None
+            or attachment_file_id is not None):
+        raise ValueError("invalid read_ack payload")
+
+
 def verify_queued_recipient(state, crypto, record, attachment_file_id=None, *, return_attachment_key=False):
     try:
         if not isinstance(record, dict) or set(record) - ALLOWED_RECORD_FIELDS:
@@ -120,9 +135,9 @@ def verify_queued_recipient(state, crypto, record, attachment_file_id=None, *, r
             if outer.get("recipient_ik") != context.public_key or outer.get("recipient_device_id") != context.device_id:
                 raise ValueError("DR recipient key or device mismatch")
             mkind = outer.get("msg_kind")
-            if mkind not in {"text", "image", "voice", "file", "delete_msg", "edit_msg", "pin_msg"}:
+            if mkind not in {"text", "image", "voice", "file", "delete_msg", "edit_msg", "pin_msg", "read_ack"}:
                 raise ValueError("invalid DR personal message kind")
-            if mkind in {"delete_msg", "edit_msg", "pin_msg"}:
+            if mkind in {"delete_msg", "edit_msg", "pin_msg", "read_ack"}:
                 if history is not None or attachment_file_id is not None:
                     raise ValueError("invalid DR control payload")
             elif history is not None:
@@ -166,10 +181,12 @@ def verify_queued_recipient(state, crypto, record, attachment_file_id=None, *, r
         plaintext = crypto.decrypt_message(encrypted, context.public_key)
         message = json.loads(plaintext)
         if not isinstance(message, dict) or message.get("type") not in {
-            "text", "image", "voice", "file", "delete_msg", "edit_msg", "pin_msg"
+            "text", "image", "voice", "file", "delete_msg", "edit_msg", "pin_msg", "read_ack"
         }:
             raise ValueError("invalid personal message")
-        if message.get("type") == "delete_msg":
+        if message.get("type") == "read_ack":
+            _verify_read_ack(message, history, attachment_file_id)
+        elif message.get("type") == "delete_msg":
             msg_id = message.get("msg_id")
             if (set(message) != {"type", "msg_id"}
                     or not isinstance(msg_id, str)
