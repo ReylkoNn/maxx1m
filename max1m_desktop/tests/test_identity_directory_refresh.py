@@ -128,3 +128,62 @@ def test_unknown_sender_refresh_adds_candidate_but_never_verifies_it():
     assert notifications and "без доверия" in notifications[0][1]
     assert worker not in screen._net_workers
     assert not screen._identity_refresh_workers
+
+
+def test_unknown_sender_without_relay_metadata_refreshes_saved_contacts():
+    state = SimpleNamespace(
+        username="alice", server_url="https://node", device_id="mine", token="session",
+        allies={
+            "carol": {"user_id": "carol-user", "devices": []},
+            "bob": {"user_id": "bob-user", "devices": []},
+        },
+    )
+    created_workers = []
+
+    class FakeSignal:
+        def connect(self, callback, connection_type=None):
+            self.callback = callback
+
+    class FakeWorker:
+        def __init__(self, server, token, username):
+            self.server, self.token, self.target_username = server, token, username
+            self.finished = FakeSignal()
+            created_workers.append(self)
+
+        def start(self):
+            pass
+
+        def wait(self):
+            return True
+
+    env = {
+        "state": state,
+        "storage": SimpleNamespace(save_allies=lambda *args: None),
+        "FindUserWorker": FakeWorker,
+        "Qt": SimpleNamespace(QueuedConnection=0),
+        "device_key_map": device_key_map,
+        "newly_advertised_devices": newly_advertised_devices,
+        "time": time,
+    }
+    queue_refresh, _finish_refresh = extract_refresh_methods(env)
+
+    class Screen:
+        def __init__(self):
+            self._net_workers = []
+            self._identity_refresh_workers = {}
+            self._identity_refresh_last_attempt = {}
+            self._identity_refresh_last_global = None
+
+    screen = Screen()
+    screen._queue_sender_directory_refresh = queue_refresh.__get__(screen)
+    error = IncomingIdentityError("unknown_sender_device", sender_tag="012345abcdef", match_count=0)
+
+    # An older relay may omit sender_username/sender_user_id. The client must
+    # still look through contacts it already has instead of leaving every
+    # delivery permanently unacknowledged.
+    screen._queue_sender_directory_refresh({"sender_device_id": "new-device"}, error)
+
+    assert len(created_workers) == 1
+    assert created_workers[0].target_username == "bob"
+    assert created_workers[0].identity_refresh_target == (
+        "bob", "bob-user", "new-device", "012345abcdef")

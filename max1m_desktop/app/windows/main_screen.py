@@ -1390,10 +1390,39 @@ class MainScreen(QFrame):
         user_id = envelope.get("sender_user_id")
         sender_device_id = envelope.get("sender_device_id")
         sender_tag = getattr(identity_error, "sender_tag", None) or "-"
-        if (not isinstance(username, str) or not username
-                or not isinstance(user_id, str) or not user_id
-                or not isinstance(sender_device_id, str) or not sender_device_id):
+        if not isinstance(sender_device_id, str) or not sender_device_id:
             logger.info("identity.directory_refresh.skipped reason=missing_sender_metadata sender_tag=%s", sender_tag)
+            return
+        if (not isinstance(username, str) or not username
+                or not isinstance(user_id, str) or not user_id):
+            # Compatibility fallback for relays that do not attach the
+            # untrusted sender-directory hint to sync/WebSocket envelopes.
+            # Refresh only contacts already saved locally; the directory data
+            # still cannot create trust, and the delivery stays unacknowledged
+            # until the user verifies any newly discovered device.
+            candidates = []
+            if isinstance(state.allies, dict):
+                for candidate_name in sorted(
+                        name for name in state.allies if isinstance(name, str)):
+                    candidate = state.allies.get(candidate_name)
+                    candidate_user_id = candidate.get("user_id") if isinstance(candidate, dict) else None
+                    if (isinstance(candidate_user_id, str) and candidate_user_id
+                            and isinstance(candidate.get("devices"), list)):
+                        candidates.append((candidate_name, candidate_user_id))
+            if not candidates:
+                logger.info("identity.directory_refresh.skipped reason=missing_sender_metadata sender_tag=%s", sender_tag)
+                return
+            logger.info("identity.directory_refresh.fallback candidates=%d sender_tag=%s",
+                        len(candidates), sender_tag)
+            for candidate_name, candidate_user_id in candidates:
+                self._queue_sender_directory_refresh(
+                    {
+                        "sender_username": candidate_name,
+                        "sender_user_id": candidate_user_id,
+                        "sender_device_id": sender_device_id,
+                    },
+                    identity_error,
+                )
             return
 
         contact = state.allies.get(username) if isinstance(state.allies, dict) else None
