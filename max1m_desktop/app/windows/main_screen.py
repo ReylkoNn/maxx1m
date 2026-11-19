@@ -7241,7 +7241,7 @@ class MainScreen(QFrame):
             return
         print(f"[CALL] Принимаем от @{self.active_call_username}")
         try:
-            rtc.activate_call(device_id, call_id)
+            rtc.prepare_incoming_call(device_id, call_id)
         except (ValueError, RuntimeError):
             self._cleanup_call()
             QMessageBox.warning(self, "Ошибка звонка", "Не удалось начать новую аудиосессию.")
