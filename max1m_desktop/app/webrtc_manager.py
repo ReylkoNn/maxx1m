@@ -227,6 +227,13 @@ class PyAudioIO:
         self._capture_thread: Optional[threading.Thread] = None
         self._capture_lock = threading.Lock()
 
+        # Rolling audio-level diagnostics (see _maybe_log_audio_stats).
+        self._stat_cap_frames = 0
+        self._stat_cap_peak = 0
+        self._stat_play_frames = 0
+        self._stat_play_peak = 0
+        self._stats_last_log = 0.0
+
     def _ensure_pa(self) -> bool:
         if self.pa is not None:
             return True
@@ -422,6 +429,44 @@ class PyAudioIO:
                     self._capture_queue.clear()
         logger.info("PyAudio stopped")
 
+    @staticmethod
+    def _pcm16_peak(data: bytes) -> int:
+        if not data or len(data) < 2:
+            return 0
+        usable = len(data) - (len(data) % 2)
+        samples = np.frombuffer(data[:usable], dtype=np.int16)
+        if samples.size == 0:
+            return 0
+        return int(np.max(np.abs(samples.astype(np.int32))))
+
+    def _maybe_log_audio_stats(self):
+        """Every ~5 s, log mic/playback frame counts and peak levels.
+
+        "Connected but silent" bugs are otherwise invisible: mic_peak=0
+        means the capture device delivers digital silence, play_peak>0
+        with silent speakers means the output device is wrong, and
+        play_frames=0 means remote audio never reaches playback.
+        """
+        now = time.monotonic()
+        if now - self._stats_last_log < 5.0:
+            return
+        self._stats_last_log = now
+        if not (self._stat_cap_frames or self._stat_play_frames):
+            return
+        logger.info(
+            "Audio levels: mic_frames=%d mic_peak=%d play_frames=%d play_peak=%d muted=%s deafened=%s",
+            self._stat_cap_frames,
+            self._stat_cap_peak,
+            self._stat_play_frames,
+            self._stat_play_peak,
+            self.is_muted,
+            self.is_deafened,
+        )
+        self._stat_cap_frames = 0
+        self._stat_cap_peak = 0
+        self._stat_play_frames = 0
+        self._stat_play_peak = 0
+
     def _capture_loop(self):
         silence = b"\x00" * (CHUNK_SAMPLES * CHANNELS * 2)
         while self._running:
@@ -431,6 +476,11 @@ class PyAudioIO:
                     time.sleep(0.005)
                     continue
                 data = stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
+                self._stat_cap_frames += 1
+                peak = self._pcm16_peak(data)
+                if peak > self._stat_cap_peak:
+                    self._stat_cap_peak = peak
+                self._maybe_log_audio_stats()
                 if self.is_muted:
                     data = silence
                 with self._capture_lock:
@@ -469,11 +519,16 @@ class PyAudioIO:
                 if not self._playback_buffer:
                     self._first_rx_ts = time.monotonic()
                 self._playback_buffer.append(exact_frame)
+                self._stat_play_frames += 1
+                peak = self._pcm16_peak(exact_frame)
+                if peak > self._stat_play_peak:
+                    self._stat_play_peak = peak
             # Enforce hard <= 80 ms latency ceiling on network burst arrival.
             if len(self._playback_buffer) > self.MAX_PLAYBACK_FRAMES:
                 while len(self._playback_buffer) > self.TARGET_PLAYBACK_FRAMES:
                     self._playback_buffer.popleft()
                 self._priming = False
+        self._maybe_log_audio_stats()
 
     def _make_concealment_frame(self, start_sample: int) -> bytes:
         if start_sample == 0:
