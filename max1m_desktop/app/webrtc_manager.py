@@ -855,6 +855,21 @@ class VoicePeerSession:
         self.pc.addTrack(AudioCaptureTrack(self.audio_io))
         self._apply_relay_policy()
 
+    @staticmethod
+    def _sdp_media_directions(sdp: str) -> list:
+        """Per-m-section direction attributes (default sendrecv per RFC 4566)."""
+        directions = []
+        for line in (sdp or "").splitlines():
+            if line.startswith("m="):
+                directions.append("sendrecv")
+            elif (
+                directions
+                and line.startswith("a=")
+                and line[2:] in ("sendrecv", "sendonly", "recvonly", "inactive")
+            ):
+                directions[-1] = line[2:]
+        return directions
+
     async def _stats_loop(self):
         """Every 5 s log RTP packet counters for this peer.
 
@@ -880,8 +895,26 @@ class VoicePeerSession:
                 elif kind == "outbound-rtp":
                     out_packets = getattr(stat, "packetsSent", None)
                     out_bytes = getattr(stat, "bytesSent", None)
+            transceivers = []
+            try:
+                for transceiver in self.pc.getTransceivers():
+                    track = getattr(getattr(transceiver, "sender", None), "track", None)
+                    transceivers.append(
+                        "%s:%s/%s:track=%s"
+                        % (
+                            transceiver.kind,
+                            transceiver.direction,
+                            getattr(transceiver, "currentDirection", None),
+                            getattr(track, "readyState", None),
+                        )
+                    )
+            except Exception:
+                transceivers = ["?"]
+            play_state = "none"
+            if self._play_task is not None:
+                play_state = "done" if self._play_task.done() else "running"
             logger.info(
-                "RTP stats [%s]: in_packets=%s in_bytes=%s out_packets=%s out_bytes=%s rx_frames=%d rx_empty=%d",
+                "RTP stats [%s]: in_packets=%s in_bytes=%s out_packets=%s out_bytes=%s rx_frames=%d rx_empty=%d transceivers=%s play_task=%s",
                 self.peer_device_id[:8],
                 in_packets,
                 in_bytes,
@@ -889,6 +922,8 @@ class VoicePeerSession:
                 out_bytes,
                 self._rx_frames,
                 self._rx_empty_frames,
+                ",".join(transceivers),
+                play_state,
             )
 
     async def _play_loop(self, track):
@@ -934,6 +969,7 @@ class VoicePeerSession:
         await self.pc.setLocalDescription(offer)
         await self._wait_ice()
         sdp = self.pc.localDescription.sdp
+        logger.info("Voice offer directions [%s]: %s", self.peer_device_id[:8], self._sdp_media_directions(sdp))
         if self._effective_relay_only:
             from app.ice_config import filter_relay_sdp
             sdp = filter_relay_sdp(sdp)
@@ -950,11 +986,13 @@ class VoicePeerSession:
         await self.pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
         self._apply_relay_policy()
         await self._flush_pending_remote_ice()
+        logger.info("Voice remote offer directions [%s]: %s", self.peer_device_id[:8], self._sdp_media_directions(sdp))
         answer = await self.pc.createAnswer()
         self._apply_relay_policy()
         await self.pc.setLocalDescription(answer)
         await self._wait_ice()
         answer_sdp = self.pc.localDescription.sdp
+        logger.info("Voice answer directions [%s]: %s", self.peer_device_id[:8], self._sdp_media_directions(answer_sdp))
         if self._effective_relay_only:
             from app.ice_config import filter_relay_sdp
             answer_sdp = filter_relay_sdp(answer_sdp)
