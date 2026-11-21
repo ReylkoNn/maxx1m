@@ -184,7 +184,18 @@ class _ImageSkeleton(QWidget):
         from PySide6.QtCore import QTimer
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._pulse)
-        self._timer.start(40)
+        # The pulse timer runs only while the skeleton is actually visible.
+        # Starting it here would leave a live 40 ms timer behind for every
+        # hidden skeleton in the chat history.
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._timer.isActive():
+            self._timer.start(40)
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
 
     def _pulse(self):
         self._alpha += self._direction * 4
@@ -317,9 +328,11 @@ class MessageBubble(QFrame):
             self._create_reply_block(reply_to_text, reply_to_sender)
 
         # --- Skeleton ---
-        self._skeleton = _ImageSkeleton()
-        self._skeleton.setVisible(False)
-        self.bubble_layout.addWidget(self._skeleton)
+        # Created lazily by show_skeleton(): most bubbles are plain text and
+        # never need one. Eagerly creating a skeleton (with its pulse timer)
+        # for every history bubble flooded the GUI thread with timers during
+        # bulk history rendering and crashed natively (access violation).
+        self._skeleton = None
 
         # --- Картинка ---
         self.image_label = _ClickableImageLabel()
@@ -412,10 +425,16 @@ class MessageBubble(QFrame):
     # ------------------------------------------------------------------
 
     def show_skeleton(self):
-        if self._skeleton:
-            self._skeleton.setVisible(True)
-            self.msg_label.setVisible(False)
-            self.bubble.setMinimumWidth(340)
+        if self._skeleton is None:
+            self._skeleton = _ImageSkeleton()
+            image_index = self.bubble_layout.indexOf(self.image_label)
+            if image_index >= 0:
+                self.bubble_layout.insertWidget(image_index, self._skeleton)
+            else:
+                self.bubble_layout.addWidget(self._skeleton)
+        self._skeleton.setVisible(True)
+        self.msg_label.setVisible(False)
+        self.bubble.setMinimumWidth(340)
 
     def hide_skeleton(self):
         if self._skeleton:
