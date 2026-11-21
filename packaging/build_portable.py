@@ -92,6 +92,34 @@ def _patch_cpython_310_dis_bug() -> None:
         pass
 
 
+def _source_stamp(repo_root: Path, spec_file: Path) -> str:
+    """Fingerprint of everything that ends up inside the bundle.
+
+    The launcher (packaging/start_two_windows.ps1, Get-SourceStamp) computes
+    the same value to decide whether a cached Max1m.exe still matches the
+    sources on disk. Hashing only the .spec file (the old behaviour) happily
+    accepted executables built from ancient application code, so users kept
+    "testing the new version" while actually running a stale bundle.
+    Keep this algorithm byte-identical to the PowerShell implementation:
+    lines of ``<posix-relpath>:<sha256-of-file>\\n`` sorted ordinally, then
+    sha256 of the UTF-8 manifest, first 16 hex chars.
+    """
+    desktop_dir = repo_root / "max1m_desktop"
+    files = [spec_file, desktop_dir / "run_desktop.py"]
+    app_dir = desktop_dir / "app"
+    if app_dir.is_dir():
+        files.extend(app_dir.rglob("*.py"))
+    lines = []
+    for path in files:
+        if not path.is_file():
+            continue
+        rel = path.relative_to(repo_root).as_posix()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        lines.append(f"{rel}:{digest}\n")
+    lines.sort()
+    return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()[:16]
+
+
 def _win_long_path(p: Path) -> str:
     s = str(p.resolve())
     if os.name == "nt" and not s.startswith("\\\\?\\") and len(s) >= 200:
@@ -152,8 +180,8 @@ def build_bundle() -> Path:
     if not bundle_dir.is_dir():
         raise RuntimeError(f"Expected output folder not found: {bundle_dir}")
 
-    spec_stamp = hashlib.sha256(spec_file.read_bytes()).hexdigest()[:16]
-    (bundle_dir / "_build_stamp.txt").write_text(spec_stamp + "\n", encoding="ascii")
+    source_stamp = _source_stamp(pkg_dir.parent, spec_file)
+    (bundle_dir / "_build_stamp.txt").write_text(source_stamp + "\n", encoding="ascii")
 
     two_inst_bat = pkg_dir / "launch_two_instances.bat"
     if two_inst_bat.is_file():

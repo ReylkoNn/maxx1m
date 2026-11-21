@@ -49,12 +49,38 @@ function Test-ExeMatchesCurrentSpec {
     }
 }
 
-$ExpectedStamp = ""
-if (Test-Path $SpecFile) {
-    try {
-        $ExpectedStamp = (Get-FileHash -Path $SpecFile -Algorithm SHA256).Hash.Substring(0, 16).ToLower()
-    } catch {}
+function Get-SourceStamp {
+    # Byte-identical to _source_stamp() in packaging/build_portable.py:
+    # lines of "<posix-relpath>:<sha256-of-file>" sorted ordinally, then
+    # sha256 of the UTF-8 manifest, first 16 hex chars. Hashing only the
+    # .spec file accepted executables built from ancient application code.
+    param([string]$Root)
+    try { $Root = (Resolve-Path $Root).Path } catch { return "" }
+    $files = @()
+    $specPath = Join-Path $Root "packaging\max1m_desktop.spec"
+    if (Test-Path $specPath) { $files += $specPath }
+    $runDesktop = Join-Path $Root "max1m_desktop\run_desktop.py"
+    if (Test-Path $runDesktop) { $files += $runDesktop }
+    $appDir = Join-Path $Root "max1m_desktop\app"
+    if (Test-Path $appDir) {
+        $files += (Get-ChildItem -Path $appDir -Recurse -Filter *.py -File | ForEach-Object { $_.FullName })
+    }
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($f in $files) {
+        $rel = $f.Substring($Root.Length).TrimStart('\', '/') -replace '\\', '/'
+        $hash = (Get-FileHash -Path $f -Algorithm SHA256).Hash.ToLower()
+        $lines.Add(("{0}:{1}`n" -f $rel, $hash))
+    }
+    $arr = $lines.ToArray()
+    [Array]::Sort($arr, [System.StringComparer]::Ordinal)
+    $manifest = [string]::Concat($arr)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($manifest)
+    $digest = $sha.ComputeHash($bytes)
+    return ([System.BitConverter]::ToString($digest) -replace '-', '').ToLower().Substring(0, 16)
 }
+
+$ExpectedStamp = Get-SourceStamp -Root $RepoRoot
 
 $ShortRoot     = Resolve-ShortBuildRoot -BaseDir $RepoRoot
 $RepoBuiltExe  = Join-Path $ScriptDir "dist\Max1m\Max1m.exe"
