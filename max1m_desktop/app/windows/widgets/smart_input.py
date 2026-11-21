@@ -4,19 +4,20 @@ from PySide6.QtGui import QKeyEvent, QImage
 
 
 class SmartInput(QTextEdit):
-    """Умное поле ввода (Premium UX): авто-растягивание, Enter для отправки, вставка картинок из буфера."""
+    """Умное поле ввода: авто-растягивание, Enter для отправки, Ctrl+V скриншотов/файлов и Drag & Drop."""
 
     returnPressed = Signal()
-    imagePasted = Signal(bytes)  # 🔥 НОВЫЙ СИГНАЛ ДЛЯ КАРТИНОК ИЗ БУФЕРА
+    imagePasted = Signal(bytes)
+    filesDroppedOrPasted = Signal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("MessageInput")
         self.setAcceptRichText(False)
+        self.setAcceptDrops(True)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-        # Отодвигаем внутренний документ от краев для центрирования
         self.document().setDocumentMargin(12)
 
         self.min_height = 56
@@ -55,23 +56,54 @@ class SmartInput(QTextEdit):
         else:
             super().keyPressEvent(event)
 
-    # 🔥 МАГИЯ БУФЕРА ОБМЕНА
+    @staticmethod
+    def _extract_local_file_paths(mime_data) -> list[str]:
+        if mime_data is None or not mime_data.hasUrls():
+            return []
+        paths = []
+        for url in mime_data.urls():
+            if url.isLocalFile():
+                p = url.toLocalFile()
+                if p:
+                    paths.append(p)
+        return paths
+
     def insertFromMimeData(self, source):
-        """Перехватываем вставку (Ctrl+V / Контекстное меню)"""
+        """Перехватываем вставку (Ctrl+V / Контекстное меню): скриншоты и скопированные файлы."""
+        local_paths = self._extract_local_file_paths(source)
+        if local_paths:
+            self.filesDroppedOrPasted.emit(local_paths)
+            return
+
         if source.hasImage():
-            # Если в буфере картинка — достаем её
             image = source.imageData()
             if image and not image.isNull():
-                # Конвертируем QImage в сырые байты формата PNG
                 ba = QByteArray()
                 buffer = QBuffer(ba)
                 buffer.open(QIODevice.WriteOnly)
                 image.save(buffer, "PNG")
                 image_bytes = ba.data()
-
-                # Сигнализируем главному окну, что прилетела картинка!
                 self.imagePasted.emit(image_bytes)
-                return  # Останавливаем стандартную вставку (чтобы не рисовался мусор в тексте)
+                return
 
-        # Если это обычный текст — пусть вставляется как обычно
         super().insertFromMimeData(source)
+
+    def dragEnterEvent(self, event):
+        if self._extract_local_file_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._extract_local_file_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        local_paths = self._extract_local_file_paths(event.mimeData())
+        if local_paths:
+            event.acceptProposedAction()
+            self.filesDroppedOrPasted.emit(local_paths)
+            return
+        super().dropEvent(event)

@@ -1,0 +1,80 @@
+services:
+  backend:
+    build:
+      context: ../max1m_backend
+      dockerfile: Dockerfile
+    container_name: max1m-backend
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required in .env}
+      MAX1M_DATA_DIR: /data
+      ENABLE_API_DOCS: "false"
+      ALLOW_LEGACY_WS_QUERY_TOKEN: "false"
+      REQUIRE_VERIFIED_DEVICE_KEYS: "true"
+      ENABLE_PREKEYS: "true"
+      LAST_SEEN_GRANULARITY_SECONDS: "86400"
+      TRUSTED_PROXY_IPS: ""
+      CALL_STUN_URLS: ${CALL_STUN_URLS}
+      CALL_TURN_URLS: ${CALL_TURN_URLS}
+      CALL_TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:?TURN_SHARED_SECRET is required in .env}
+      CALL_TURN_CREDENTIAL_TTL_SECONDS: "3600"
+      CALL_FORCE_RELAY_RECOMMENDED: ${CALL_FORCE_RELAY_RECOMMENDED:-false}
+      MAX_GROUP_VOICE_PEERS: "8"
+    volumes:
+      - max1m_data:/data
+    networks:
+      - max1m_internal
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: max1m-caddy
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      MAX1M_DOMAIN: ${MAX1M_DOMAIN:?MAX1M_DOMAIN is required in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - max1m_internal
+    logging:
+      driver: "none"
+
+  coturn:
+    image: coturn/coturn:4.6.2-alpine
+    container_name: max1m-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - caddy_data:/caddy_data:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    logging:
+      driver: "none"
+
+networks:
+  max1m_internal:
+    driver: bridge
+
+volumes:
+  max1m_data:
+  caddy_data:
+  caddy_config:

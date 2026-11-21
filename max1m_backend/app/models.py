@@ -31,6 +31,7 @@ class Device(Base):
     public_key = Column(String(500), nullable=False)
     fingerprint = Column(String(100), nullable=False, unique=True)
     is_revoked = Column(Boolean, default=False)
+    session_version = Column(Integer, default=0, server_default="0")
     last_seen = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
@@ -52,6 +53,7 @@ class Message(Base):
     encrypted_blob = Column(Text, nullable=False)
     signature = Column(Text, nullable=False)
     is_delivered = Column(Boolean, default=False)
+    delivered_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     receiver_device = relationship(
@@ -59,6 +61,22 @@ class Message(Base):
         foreign_keys=[receiver_device_id],
         back_populates="messages"
     )
+
+
+class MessageIdempotencyRecord(Base):
+    """Compact digest tombstone retained after delivered message ciphertexts are pruned.
+
+    Preserves both /messages/send-reliable idempotency/conflict detection and
+    /messages/sync-safe cursor continuity without retaining multi-megabyte blobs.
+    """
+    __tablename__ = "message_idempotency"
+
+    message_id = Column(String(64), primary_key=True)
+    sender_device_id = Column(String, ForeignKey("devices.id"), nullable=False)
+    receiver_device_id = Column(String, ForeignKey("devices.id"), nullable=False, index=True)
+    payload_sha256 = Column(String(64), nullable=False)
+    original_created_at = Column(DateTime, nullable=False)
+    compacted_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
 
 class InviteCode(Base):
@@ -81,6 +99,7 @@ class Group(Base):
     id = Column(String, primary_key=True, default=generate_uuid)
     name = Column(String(100), nullable=False)
     created_by_device_id = Column(String, ForeignKey("devices.id"), nullable=False)
+    epoch = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     members = relationship(
@@ -129,6 +148,7 @@ class GroupMessage(Base):
     signature = Column(Text, nullable=False)
     # Метаданные Sender Keys
     sender_key_id = Column(String(64), nullable=False)
+    epoch = Column(Integer, nullable=False, default=1)
     chain_index = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
@@ -180,6 +200,7 @@ class SenderKeyDistribution(Base):
     encrypted_sender_key = Column(Text, nullable=False)
     # Ed25519 подпись sender_device — получатель может верифицировать
     sender_key_signature = Column(Text, nullable=False)
+    epoch = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
@@ -221,6 +242,14 @@ class FileRecord(Base):
     )
 
 
+class UploadReservation(Base):
+    """Bind an unfinished reliable upload ID to its device before disk publication."""
+    __tablename__ = "upload_reservations"
+    file_id = Column(String, primary_key=True)
+    device_id = Column(String, ForeignKey("devices.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class FileAccess(Base):
     """
     Белый список устройств, которые могут скачивать файл.
@@ -240,3 +269,30 @@ class FileAccess(Base):
     )
 
     file = relationship("FileRecord", back_populates="accesses")
+
+# Experimental public prekey transport. Never stores private key material.
+class ExperimentalPreKeyBundle(Base):
+    __tablename__ = "experimental_prekey_bundles"
+    device_id = Column(String, ForeignKey("devices.id"), primary_key=True)
+    version = Column(Integer, nullable=False)
+    signed_prekey = Column(String(44), nullable=False)
+    signature = Column(String(88), nullable=False)
+
+
+class ExperimentalOneTimePreKey(Base):
+    __tablename__ = "experimental_one_time_prekeys"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    device_id = Column(String, ForeignKey("devices.id"), nullable=False, index=True)
+    key_id = Column(String(36), nullable=False)
+    public_key = Column(String(44), nullable=False)
+    claimed_by = Column(String, ForeignKey("devices.id"), nullable=True)
+    request_id = Column(String(36), nullable=True)
+    claimed_identity_key = Column(String(500), nullable=True)
+    claimed_signed_prekey = Column(String(44), nullable=True)
+    claimed_signature = Column(String(88), nullable=True)
+    claimed_version = Column(Integer, nullable=True)
+    __table_args__ = (
+        UniqueConstraint("device_id", "key_id", name="uq_experimental_prekey_id"),
+        UniqueConstraint("device_id", "public_key", name="uq_experimental_prekey_public"),
+        UniqueConstraint("claimed_by", "request_id", name="uq_experimental_prekey_claim"),
+    )

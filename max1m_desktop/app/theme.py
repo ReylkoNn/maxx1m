@@ -379,6 +379,20 @@ QPushButton#PrimaryButton:disabled {{
     border: 1px solid {t['line_soft']};
 }}
 
+QPushButton#DangerButton {{
+    background: {t['bg_button']};
+    color: {t['danger']};
+    border: 1px solid {t['danger']};
+    border-radius: 12px;
+    padding: 6px 12px;
+    font-weight: 600;
+}}
+
+QPushButton#DangerButton:hover {{
+    background: {t['danger']};
+    color: #ffffff;
+}}
+
 QPushButton#ModeButton {{
     background: {t['bg_button']};
     color: {t['text_soft']};
@@ -810,18 +824,12 @@ QLabel#BubbleTime {{
 }}
 
 QLabel#BubbleStatus {{
-    font-size: 12px;
-    font-weight: 700;
+    min-width: 14px;
+    max-width: 14px;
+    min-height: 14px;
+    max-height: 14px;
     background: transparent;
     border: none;
-}}
-
-QLabel#BubbleStatus[read="true"] {{
-    color: #4DA6FF;
-}}
-
-QLabel#BubbleStatus[read="false"] {{
-    color: {t['text_dim']};
 }}
 
 /* ============================================================================
@@ -1999,6 +2007,84 @@ QFrame#CreateGroupPanel {{
     border: none;
 }}
 
+QFrame#AnimatedBgFrame,
+QFrame#SizeGripContainer,
+QLabel#SvgLabel,
+QLabel#DocumentAttachmentIcon,
+QLabel#GroupVoiceStatusIcon {{
+    background: transparent;
+    border: none;
+}}
+
+QPushButton#PinnedJumpButton {{
+    background: transparent;
+    color: {t['text_soft']};
+    border: none;
+    text-align: left;
+    font-weight: 600;
+    padding: 4px 0px;
+}}
+
+QPushButton#PinnedJumpButton:hover {{
+    color: {t['accent']};
+}}
+
+QPushButton#PinnedUnpinButton {{
+    background: transparent;
+    border: none;
+    border-radius: 13px;
+}}
+
+QPushButton#PinnedUnpinButton:hover {{
+    background: {t['bg_input_hover']};
+}}
+
+QPushButton#GroupVoiceJoinButton {{
+    background: {t['accent']};
+    color: {"#ffffff" if theme_name == "obsidian" else t['text_main']};
+    border: 1px solid {t['accent_border']};
+    border-radius: 10px;
+    padding: 5px 12px;
+    font-weight: 600;
+}}
+
+QPushButton#GroupVoiceJoinButton:hover {{
+    background: {t['accent_end']};
+}}
+
+QPushButton#GroupVoiceControlButton,
+QPushButton#GroupVoicePeerButton {{
+    background: {t['bg_button']};
+    color: {t['text_soft']};
+    border: 1px solid {t['line_soft']};
+    border-radius: 10px;
+    padding: 5px 10px;
+}}
+
+QPushButton#GroupVoiceControlButton:hover,
+QPushButton#GroupVoicePeerButton:hover {{
+    background: {t['bg_button_hover']};
+    border-color: {t['line_focus']};
+    color: {t['text_main']};
+}}
+
+QPushButton#GroupVoicePeerButton[speaking="true"] {{
+    border-color: {t['success']};
+    color: {t['success']};
+}}
+
+QPushButton#GroupVoiceLeaveButton {{
+    background: {t['bg_button']};
+    color: {t['danger']};
+    border: 1px solid {t['danger']};
+    border-radius: 10px;
+    padding: 5px 10px;
+}}
+
+QPushButton#GroupVoiceLeaveButton:hover {{
+    background: {t['danger']};
+    color: #ffffff;
+}}
 
 /* ============================================================================
    MESSAGES CONTAINER

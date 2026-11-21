@@ -82,6 +82,7 @@ class MonitorPreviewCard(QFrame):
 
 class ScreenShareOverlay(QFrame):
     monitor_selected = Signal(int)
+    quality_selected = Signal(str)
     cancelled = Signal()
 
     def __init__(self, parent=None):
@@ -95,22 +96,42 @@ class ScreenShareOverlay(QFrame):
         self.setFocusPolicy(Qt.NoFocus)
 
         self._cards = []
+        self._selected_quality = "balanced"
+        self._quality_buttons = {}
         self.container = QFrame()
         self.container.setObjectName("ScreenShareOverlayContainer")
 
         layout = QVBoxLayout(self.container)
         layout.setContentsMargins(40, 40, 40, 40)
-        layout.setSpacing(20)
+        layout.setSpacing(18)
 
-        title = QLabel("CHOOSE SCREEN")
+        title = QLabel("ВЫБЕРИТЕ ЭКРАН (E2EE)")
         title.setObjectName("ScreenShareOverlayTitle")
         title.setAlignment(Qt.AlignCenter)
+
+        quality_row = QHBoxLayout()
+        quality_row.setSpacing(10)
+        quality_row.setAlignment(Qt.AlignCenter)
+        for q_key, q_label in (
+            ("smooth", "Плавное • 540p 30 FPS"),
+            ("balanced", "Баланс • 720p 24 FPS"),
+            ("sharp", "Чёткое • 900p 20 FPS"),
+        ):
+            q_btn = QPushButton(q_label)
+            q_btn.setCheckable(True)
+            q_btn.setChecked(q_key == self._selected_quality)
+            q_btn.setCursor(Qt.PointingHandCursor)
+            q_btn.setFocusPolicy(Qt.NoFocus)
+            q_btn.setFixedHeight(34)
+            q_btn.clicked.connect(lambda _checked=False, k=q_key: self._select_quality(k))
+            self._quality_buttons[q_key] = q_btn
+            quality_row.addWidget(q_btn)
 
         self.monitors_layout = QHBoxLayout()
         self.monitors_layout.setSpacing(20)
         self.monitors_layout.setAlignment(Qt.AlignCenter)
 
-        cancel_btn = QPushButton("Cancel")
+        cancel_btn = QPushButton("Отмена")
         cancel_btn.setObjectName("ScreenShareOverlayCancelBtn")
         cancel_btn.setFixedSize(140, 44)
         cancel_btn.setCursor(Qt.PointingHandCursor)
@@ -118,13 +139,20 @@ class ScreenShareOverlay(QFrame):
         cancel_btn.clicked.connect(self._on_cancel)
 
         layout.addWidget(title)
+        layout.addLayout(quality_row)
         layout.addLayout(self.monitors_layout)
-        layout.addSpacing(20)
+        layout.addSpacing(12)
         layout.addWidget(cancel_btn, alignment=Qt.AlignCenter)
 
         self.fade_anim = QPropertyAnimation(self, b"windowOpacity")
         self.fade_anim.setDuration(200)
         self.fade_anim.setEasingCurve(QEasingCurve.OutCubic)
+
+    def _select_quality(self, quality: str):
+        self._selected_quality = quality
+        for k, btn in self._quality_buttons.items():
+            btn.setChecked(k == quality)
+        self.quality_selected.emit(quality)
 
     def show_overlay(self):
         while self.monitors_layout.count():
@@ -221,28 +249,38 @@ class ScreenShareViewer(QFrame):
         self._maximize_btn.hide()
         self.hide()
 
-    def start_viewing(self, sender_device_id: str):
+    def start_viewing(self, sender_device_id: str, sender_label: str = ""):
         self._sender_id = sender_device_id
+        self._sender_label = sender_label
         self._pixmap = None
+        self._scaled_pixmap = None
+        self._scaled_key = None
         self.show()
         self.raise_()
         self.update()
 
     def stop_viewing(self):
         self._pixmap = None
+        self._scaled_pixmap = None
+        self._scaled_key = None
         self._sender_id = ""
+        self._sender_label = ""
         self._is_maximized = False
+        self._fps_label.hide()
         self.hide()
         self.update()
 
     def set_frame(self, pixmap: QPixmap):
         if pixmap and not pixmap.isNull():
             self._pixmap = pixmap
+            self._scaled_pixmap = None
+            self._scaled_key = None
             self.update()
 
     def set_fps(self, fps: float):
-        self._fps_label.setText(f"{fps:.0f} FPS")
-        self._fps_label.show()
+        if fps > 0:
+            self._fps_label.setText(f"{fps:.0f} FPS")
+            self._fps_label.show()
 
     def _toggle_maximize(self):
         self._is_maximized = not self._is_maximized
@@ -265,7 +303,7 @@ class ScreenShareViewer(QFrame):
             painter = QPainter(self)
             painter.fillRect(self.rect(), QColor(t.get("bg_panel", "#111317")))
             painter.setPen(QColor(t.get("text_dim", "#777e8e")))
-            painter.drawText(self.rect(), Qt.AlignCenter, "Waiting for video...")
+            painter.drawText(self.rect(), Qt.AlignCenter, "Ожидание защищённого видеопотока (E2EE)...")
             painter.end()
             return
 
@@ -273,9 +311,14 @@ class ScreenShareViewer(QFrame):
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.fillRect(self.rect(), QColor(t.get("bg_panel", "#111317")))
 
-        scaled = self._pixmap.scaled(
-            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
+        key = (self._pixmap.cacheKey(), self.width(), self.height())
+        if getattr(self, "_scaled_key", None) != key or getattr(self, "_scaled_pixmap", None) is None:
+            self._scaled_pixmap = self._pixmap.scaled(
+                self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self._scaled_key = key
+
+        scaled = self._scaled_pixmap
         x = (self.width() - scaled.width()) // 2
         y = (self.height() - scaled.height()) // 2
         painter.drawPixmap(x, y, scaled)
@@ -286,7 +329,8 @@ class ScreenShareViewer(QFrame):
             font.setBold(True)
             painter.setFont(font)
 
-            label = f"Screen share from {self._sender_id[:8]}..."
+            peer_title = getattr(self, "_sender_label", "") or f"{self._sender_id[:8]}..."
+            label = f"Демонстрация экрана • {peer_title} (E2EE)"
             fm = painter.fontMetrics()
             text_w = fm.horizontalAdvance(label)
             text_h = fm.height()
@@ -310,6 +354,8 @@ class ScreenShareViewer(QFrame):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._scaled_pixmap = None
+        self._scaled_key = None
         self._close_btn.move(self.width() - 36, 8)
         self._maximize_btn.move(self.width() - 68, 8)
         self._fps_label.move(8, self.height() - 28)

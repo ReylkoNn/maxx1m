@@ -1,0 +1,5 @@
+# Optional local WebRTC loopback tests; no hardware or TURN server required.
+-r requirements-test.txt
+aiortc==1.14.0
+av==16.1.0
+numpy==2.4.6
