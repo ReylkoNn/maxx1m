@@ -54,6 +54,30 @@ def test_stats_loop_reports_transceiver_directions():
     assert "play_task" in src
 
 
+def test_sender_state_checkpoints_cover_negotiation():
+    session = _class(_tree(), "VoicePeerSession")
+    helper = ast.unparse(_method(session, "_log_sender_state"))
+    assert "_enabled" in helper
+    assert "transport" in helper
+    for method_name, stage in (
+        ("create_offer", "after-setLocal-offer"),
+        ("handle_offer", "after-setRemote-offer"),
+        ("handle_offer", "after-setLocal-answer"),
+        ("handle_answer", "after-setRemote-answer"),
+    ):
+        assert stage in ast.unparse(_method(session, method_name)), (method_name, stage)
+    assert "after-addTrack" in ast.unparse(_method(session, "create"))
+
+
+def test_aiortc_sender_logs_are_forwarded():
+    tree = _tree()
+    names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    assert "_forward_aiortc_sender_logs" in names
+    path = Path(__file__).resolve().parents[1] / "app/webrtc_manager.py"
+    src = path.read_text(encoding="utf-8")
+    assert "aiortc.rtcrtpsender" in src
+
+
 def test_sdp_directions_are_logged_for_offer_and_answer():
     session = _class(_tree(), "VoicePeerSession")
     helper = _method(session, "_sdp_media_directions")

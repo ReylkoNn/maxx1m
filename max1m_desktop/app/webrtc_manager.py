@@ -33,6 +33,38 @@ from app.ice_config import ice_server_settings
 
 logger = logging.getLogger("max1m.webrtc")
 
+
+class _AiortcLogForwarder(logging.Handler):
+    """Forward aiortc sender logs into client.log.
+
+    The app logger (max1m.*) does not propagate to root, so aiortc's
+    warnings — including the traceback when its RTP sender task dies —
+    would otherwise vanish (pythonw has no stderr).
+    """
+
+    def emit(self, record):
+        try:
+            logger.warning("aiortc.%s: %s", record.name, record.getMessage())
+        except Exception:
+            pass
+
+
+_aiortc_logs_forwarded = False
+
+
+def _forward_aiortc_sender_logs():
+    global _aiortc_logs_forwarded
+    if _aiortc_logs_forwarded:
+        return
+    _aiortc_logs_forwarded = True
+    for name in ("aiortc.rtcrtpsender", "aiortc.rtcrtpreceiver", "aiortc.rtcpeerconnection"):
+        try:
+            aiortc_logger = logging.getLogger(name)
+            aiortc_logger.addHandler(_AiortcLogForwarder())
+            aiortc_logger.setLevel(logging.DEBUG)
+        except Exception:
+            pass
+
 try:
     import pyaudio
     PYAUDIO_AVAILABLE = True
@@ -854,6 +886,43 @@ class VoicePeerSession:
 
         self.pc.addTrack(AudioCaptureTrack(self.audio_io))
         self._apply_relay_policy()
+        self._log_sender_state("after-addTrack")
+        _forwarder = globals().get("_forward_aiortc_sender_logs")
+        if callable(_forwarder):
+            _forwarder()
+
+    def _log_sender_state(self, stage: str):
+        """Log local sender track state at each negotiation stage.
+
+        aiortc's RTCRtpSender silently sets its track to None when its
+        RTP task dies (recv/encode exception), which turns a call into
+        "connected but zero packets" with no other trace. These
+        checkpoints show exactly when the track disappears.
+        """
+        try:
+            parts = []
+            for transceiver in self.pc.getTransceivers():
+                sender = getattr(transceiver, "sender", None)
+                track = getattr(sender, "track", None)
+                transport = getattr(sender, "transport", None)
+                parts.append(
+                    "%s:track=%s:%s enabled=%s transport=%s"
+                    % (
+                        transceiver.kind,
+                        type(track).__name__ if track is not None else None,
+                        getattr(track, "readyState", None),
+                        getattr(sender, "_enabled", "?"),
+                        getattr(transport, "state", None),
+                    )
+                )
+            logger.info(
+                "Voice sender [%s] %s: %s",
+                self.peer_device_id[:8],
+                stage,
+                ",".join(parts) or "-",
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _sdp_media_directions(sdp: str) -> list:
@@ -900,11 +969,12 @@ class VoicePeerSession:
                 for transceiver in self.pc.getTransceivers():
                     track = getattr(getattr(transceiver, "sender", None), "track", None)
                     transceivers.append(
-                        "%s:%s/%s:track=%s"
+                        "%s:%s/%s:track=%s:%s"
                         % (
                             transceiver.kind,
                             transceiver.direction,
                             getattr(transceiver, "currentDirection", None),
+                            type(track).__name__ if track is not None else None,
                             getattr(track, "readyState", None),
                         )
                     )
@@ -968,6 +1038,7 @@ class VoicePeerSession:
         self._apply_relay_policy()
         await self.pc.setLocalDescription(offer)
         await self._wait_ice()
+        self._log_sender_state("after-setLocal-offer")
         sdp = self.pc.localDescription.sdp
         logger.info("Voice offer directions [%s]: %s", self.peer_device_id[:8], self._sdp_media_directions(sdp))
         if self._effective_relay_only:
@@ -984,6 +1055,7 @@ class VoicePeerSession:
             from app.ice_config import filter_relay_sdp
             sdp = filter_relay_sdp(sdp)
         await self.pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
+        self._log_sender_state("after-setRemote-offer")
         self._apply_relay_policy()
         await self._flush_pending_remote_ice()
         logger.info("Voice remote offer directions [%s]: %s", self.peer_device_id[:8], self._sdp_media_directions(sdp))
@@ -991,6 +1063,7 @@ class VoicePeerSession:
         self._apply_relay_policy()
         await self.pc.setLocalDescription(answer)
         await self._wait_ice()
+        self._log_sender_state("after-setLocal-answer")
         answer_sdp = self.pc.localDescription.sdp
         logger.info("Voice answer directions [%s]: %s", self.peer_device_id[:8], self._sdp_media_directions(answer_sdp))
         if self._effective_relay_only:
@@ -1007,6 +1080,7 @@ class VoicePeerSession:
             from app.ice_config import filter_relay_sdp
             sdp = filter_relay_sdp(sdp)
         await self.pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="answer"))
+        self._log_sender_state("after-setRemote-answer")
         await self._flush_pending_remote_ice()
 
     async def add_ice(self, data: dict):
