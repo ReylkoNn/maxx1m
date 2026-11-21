@@ -719,6 +719,9 @@ class VoicePeerSession:
         self._pending_remote_ice = []
         self.pc: Optional[RTCPeerConnection] = None
         self._play_task: Optional[asyncio.Task] = None
+        self._stats_task: Optional[asyncio.Task] = None
+        self._rx_frames = 0
+        self._rx_empty_frames = 0
         self.remote_dtls_fp: Optional[str] = None
         self._closed = False
 
@@ -814,6 +817,7 @@ class VoicePeerSession:
         )
         ice = [RTCIceServer(**srv) for srv in servers_cfg]
         self.pc = RTCPeerConnection(RTCConfiguration(iceServers=ice))
+        self._stats_task = asyncio.ensure_future(self._stats_loop())
         pid = self.peer_device_id
 
         @self.pc.on("connectionstatechange")
@@ -851,16 +855,55 @@ class VoicePeerSession:
         self.pc.addTrack(AudioCaptureTrack(self.audio_io))
         self._apply_relay_policy()
 
+    async def _stats_loop(self):
+        """Every 5 s log RTP packet counters for this peer.
+
+        Splits "connected but silent" into sender-not-sending
+        (out_packets stuck), network/ICE-not-delivering (out grows,
+        in_packets stuck) and receiver-not-decoding (in grows,
+        rx_frames stuck).
+        """
+        while not self._closed:
+            await asyncio.sleep(5.0)
+            if self._closed or not self.pc:
+                return
+            try:
+                report = await self.pc.getStats()
+            except Exception:
+                continue
+            in_packets = in_bytes = out_packets = out_bytes = None
+            for stat in report.values():
+                kind = getattr(stat, "type", "")
+                if kind == "inbound-rtp":
+                    in_packets = getattr(stat, "packetsReceived", None)
+                    in_bytes = getattr(stat, "bytesReceived", None)
+                elif kind == "outbound-rtp":
+                    out_packets = getattr(stat, "packetsSent", None)
+                    out_bytes = getattr(stat, "bytesSent", None)
+            logger.info(
+                "RTP stats [%s]: in_packets=%s in_bytes=%s out_packets=%s out_bytes=%s rx_frames=%d rx_empty=%d",
+                self.peer_device_id[:8],
+                in_packets,
+                in_bytes,
+                out_packets,
+                out_bytes,
+                self._rx_frames,
+                self._rx_empty_frames,
+            )
+
     async def _play_loop(self, track):
         try:
             while not self._closed:
                 frame = await track.recv()
                 if self._closed:
                     break
+                self._rx_frames += 1
                 vol = float(getattr(self.audio_io, "remote_volume", 1.0))
                 pcm = self.decode_frame_to_mono_pcm16(frame, target_rate=RATE, volume=vol)
                 if pcm:
                     self.audio_io.write(pcm)
+                else:
+                    self._rx_empty_frames += 1
         except asyncio.CancelledError:
             pass
         except MediaStreamError:
@@ -965,6 +1008,8 @@ class VoicePeerSession:
     async def close(self):
         self._closed = True
         self._pending_remote_ice.clear()
+        if self._stats_task and not self._stats_task.done():
+            self._stats_task.cancel()
         if self._play_task and not self._play_task.done():
             self._play_task.cancel()
         if self.pc:
