@@ -640,6 +640,12 @@ class GroupVoiceRoomController:
             def _run_v():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
+                try:
+                    from app.webrtc_manager import ensure_loop_executor
+
+                    ensure_loop_executor(loop, "max1m-group-voice")
+                except Exception:
+                    pass
                 self._voice_loop = loop
                 ready.set()
                 loop.run_forever()
@@ -654,6 +660,12 @@ class GroupVoiceRoomController:
             def _run_s():
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
+                try:
+                    from app.webrtc_manager import ensure_loop_executor
+
+                    ensure_loop_executor(loop, "max1m-group-screen")
+                except Exception:
+                    pass
                 self._screen_loop = loop
                 s_ready.set()
                 loop.run_forever()

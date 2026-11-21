@@ -43,10 +43,61 @@ class _AiortcLogForwarder(logging.Handler):
     """
 
     def emit(self, record):
+        if record.levelno < logging.WARNING:
+            return
         try:
             logger.warning("aiortc.%s: %s", record.name, record.getMessage())
         except Exception:
             pass
+
+
+def _make_loop_executor(thread_name_prefix: str):
+    """Create a real ThreadPoolExecutor for an aiortc event loop.
+
+    Root cause of "connected but no sound" on Python 3.15: inside the
+    full application process, ``concurrent.futures.ThreadPoolExecutor``
+    as seen from ``asyncio.base_events.run_in_executor`` can be an
+    uncallable ``lazy_import`` proxy object. aiortc's RTP sender calls
+    ``run_in_executor(None, encoder.encode, ...)`` for its very first
+    frame, gets ``TypeError: 'lazy_import' object is not callable``,
+    and its RTP task dies — clearing sender.track to None and sending
+    zero packets forever, while RTCP keepalives make the call look
+    healthy. Handing the loop a pre-built executor bypasses the broken
+    lazy creation path entirely.
+    """
+    import concurrent.futures as _cf
+
+    cls = _cf.ThreadPoolExecutor
+    try:
+        return cls(max_workers=4, thread_name_prefix=thread_name_prefix)
+    except TypeError:
+        logger.warning(
+            "ThreadPoolExecutor is a lazy proxy (%r); forcing materialization",
+            type(cls),
+        )
+        import importlib
+
+        module = importlib.import_module("concurrent.futures")
+        cls = getattr(module, "ThreadPoolExecutor")
+        _ = cls.__name__  # dunder access materializes lazy-import proxies
+        return cls(max_workers=4, thread_name_prefix=thread_name_prefix)
+
+
+def ensure_loop_executor(loop, thread_name_prefix: str) -> bool:
+    """Set a pre-built default executor on an aiortc loop (see above)."""
+    try:
+        executor = _make_loop_executor(thread_name_prefix)
+        loop.set_default_executor(executor)
+        logger.info("Default executor ready for %s loop", thread_name_prefix)
+        return True
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not break calls
+        logger.warning(
+            "Could not set default executor for %s loop: %s: %s",
+            thread_name_prefix,
+            type(exc).__name__,
+            exc,
+        )
+        return False
 
 
 _aiortc_logs_forwarded = False
@@ -1172,6 +1223,7 @@ class WebRTCManager:
         self._voice_gate = asyncio.Lock()
 
         self._voice_loop = asyncio.new_event_loop()
+        ensure_loop_executor(self._voice_loop, "max1m-voice")
         self._voice_thread = threading.Thread(
             target=lambda: (
                 asyncio.set_event_loop(self._voice_loop),
@@ -1204,6 +1256,7 @@ class WebRTCManager:
                 return loop
 
             new_loop = asyncio.new_event_loop()
+            ensure_loop_executor(new_loop, "max1m-screen")
             ready = threading.Event()
 
             def _runner():
